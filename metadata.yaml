@@ -1,0 +1,22 @@
+name: live_monitor
+display_name: 直播开播监控
+short_desc: 监控直播间开播/关播状态并自动通知订阅的群或个人。
+desc: >-
+  支持 B站直播、斗鱼、虎牙、抖音直播的开播/关播监控。
+  可在聊天中通过 /直播监控 添加、删除、订阅直播间，
+  开播或关播时自动向订阅的会话推送通知。
+author: pulin
+version: 0.1.1
+repo: "https://github.com/qzuser/live-monitor"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - discord
+  - dingtalk
+  - wecom
+  - wecom_ai_bot
+  - qq_official
+  - lark
+  - satori
+  - weixin_official_account
+astrbot_version: ">=4.17,<5"

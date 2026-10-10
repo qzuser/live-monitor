@@ -1,0 +1,44 @@
+{
+  "admin_ids": {
+    "description": "管理员用户ID（QQ号/Telegram ID等），多个用逗号分隔；留空则所有人可添加/订阅",
+    "type": "string",
+    "default": ""
+  },
+  "start_check_interval": {
+    "description": "开播检测间隔（秒）。未开播的房间按此频率轮询，检测是否开播。最小生效 15 秒，过小可能被直播平台限流",
+    "type": "int",
+    "default": 30
+  },
+  "end_check_interval": {
+    "description": "关播检测间隔（秒）。正在直播中的房间按此频率轮询，检测是否关播。最小生效 15 秒",
+    "type": "int",
+    "default": 60
+  },
+  "poll_interval": {
+    "description": "（旧配置，已拆分。仅当上面两项未设置时作为统一间隔生效）",
+    "type": "int",
+    "default": 0,
+    "invisible": true
+  },
+  "notify_start": {
+    "description": "开播时是否推送通知",
+    "type": "bool",
+    "default": true
+  },
+  "notify_end": {
+    "description": "关播时是否推送通知",
+    "type": "bool",
+    "default": true
+  },
+  "notify_whitelist": {
+    "description": "通知白名单（会话UMO），多个用逗号分隔；留空则不限制、推送给所有订阅会话。UMO可在 /直播监控 列表(管理员) 或日志中查看，如 aiocqhttp:GroupMessage:123456789",
+    "type": "text",
+    "default": ""
+  },
+  "bilibili_cookie": {
+    "description": "B站直播 Cookie（可选，监控无头信息接口失败时填写）",
+    "type": "string",
+    "secret": true,
+    "default": ""
+  }
+}
