@@ -26,6 +26,20 @@ MAX_PENDING_TOTAL = 50
 
 DIVIDER = "────────────────"
 
+# 自动更新检查：启动后第一次检查的延迟。延迟是为了避开插件加载阶段
+# （此时主动消息通道可能还没就绪），之后按配置项 update_check_interval_hours 定期查。
+UPDATE_FIRST_DELAY = 60
+DEFAULT_UPDATE_INTERVAL_HOURS = 24
+
+# 与 AstrBot 自带更新器（core/zip_updator.py check_update）保持一致的预发布标签口径，
+# 否则插件提醒的版本和 WebUI 里能更新的版本可能对不上。
+PRERELEASE_RE = re.compile(r"[\-_.]?(alpha|beta|rc|dev)[\-_.]?\d*$", re.IGNORECASE)
+
+GITHUB_REPO_RE = re.compile(r"github\.com/([\w.()-]+)/([\w.()-]+)", re.IGNORECASE)
+
+GITHUB_HEADERS = dict(HEADERS)
+GITHUB_HEADERS["Accept"] = "application/vnd.github+json"
+
 PLATFORM_NAMES = {
     "bilibili": "B站直播",
     "douyu": "斗鱼",
@@ -250,6 +264,47 @@ def room_key(platform: str, room_id: str) -> str:
     return f"{platform}:{room_id}"
 
 
+def read_plugin_meta() -> tuple[str, str]:
+    """从插件自身目录的 metadata.yaml 读取 (version, repo)。
+
+    版本号只在 metadata 里维护一份：这里直接解析，避免 main.py 再抄一遍常量后
+    和 metadata.yaml 漂移；顺带把 repo 也取出来当作更新检查的地址来源。
+    """
+    try:
+        text = (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8")
+    except Exception:
+        return "", ""
+    version = ""
+    repo = ""
+    m = re.search(r"^version:\s*(\S+)\s*$", text, re.MULTILINE)
+    if m:
+        version = m.group(1).strip("\"'")
+    m = re.search(r"^repo:\s*(.+?)\s*$", text, re.MULTILINE)
+    if m:
+        repo = m.group(1).strip("\"'")
+    return version, repo
+
+
+def parse_version(text) -> tuple:
+    """取出版本号里的数字段，v 前缀、缺位、非数字后缀都忽略。"""
+    m = re.search(r"v?(\d+(?:\.\d+)*)", str(text or ""))
+    if not m:
+        return ()
+    return tuple(int(part) for part in m.group(1).split("."))
+
+
+def version_is_newer(candidate, current) -> bool:
+    """比较两个版本号，位数不足的一侧按 0 补齐（0.1.10 > 0.1.9）。"""
+    left = parse_version(candidate)
+    right = parse_version(current)
+    if not left or not right:
+        return False
+    size = max(len(left), len(right))
+    left += (0,) * (size - len(left))
+    right += (0,) * (size - len(right))
+    return left > right
+
+
 def format_submission(sub: dict, header: str, actions: list[str] | None = None) -> str:
     """渲染投稿记录：投送给审核会话时带处理指令，回投投稿人时不带。"""
     lines = [
@@ -290,6 +345,14 @@ class LiveMonitorPlugin(Star):
         self.reviewers: dict = {}
         self._next_sub_id = 1
         self._last_check: dict[str, float] = {}
+        self.version, repo_url = read_plugin_meta()
+        m = GITHUB_REPO_RE.search(repo_url)
+        self._repo_slug = f"{m.group(1)}/{m.group(2)}" if m else ""
+        self._repo_page = (
+            f"https://github.com/{self._repo_slug}" if self._repo_slug else ""
+        )
+        self._next_update_check = time.monotonic() + UPDATE_FIRST_DELAY
+        self._update_hint_version = ""
         self._load()
         global _poll_task
         if _poll_task is not None and not _poll_task.done():
@@ -873,6 +936,136 @@ class LiveMonitorPlugin(Star):
             return f"{minutes // 60} 小时前"
         return f"{minutes // (24 * 60)} 天前"
 
+    # ---------- 插件自动更新检查 ----------
+
+    async def _fetch_releases(self, session: aiohttp.ClientSession) -> list:
+        url = f"https://api.github.com/repos/{self._repo_slug}/releases"
+        async with session.get(
+            url, headers=GITHUB_HEADERS, timeout=aiohttp.ClientTimeout(10)
+        ) as resp:
+            if resp.status != 200:
+                raise RoomCheckError(f"GitHub API HTTP {resp.status}")
+            data = await resp.json(**_get_json_kwargs())
+        if not isinstance(data, list):
+            raise RoomCheckError("GitHub Release 返回格式不对（顶层不是数组）")
+        return data
+
+    def _pick_release(self, releases: list) -> dict | None:
+        """取最新的正式版：跳过 draft、prerelease 与 alpha/beta/rc/dev 标签。"""
+        for item in releases:
+            if not isinstance(item, dict):
+                continue
+            if item.get("draft") or item.get("prerelease"):
+                continue
+            tag = str(item.get("tag_name") or "")
+            if not tag or PRERELEASE_RE.search(tag):
+                continue
+            return item
+        return None
+
+    @staticmethod
+    def _release_info(item: dict) -> dict:
+        return {
+            "version": str(item.get("tag_name") or ""),
+            "published_at": str(item.get("published_at") or "")[:10],
+            "body": str(item.get("body") or ""),
+            "url": str(item.get("html_url") or ""),
+        }
+
+    def _update_text(self, release: dict, header: str) -> str:
+        lines = [
+            header,
+            DIVIDER,
+            f"📦 当前版本：v{self.version or '未知'}",
+            f"✨ 最新版本：{release['version']}",
+        ]
+        if release["published_at"]:
+            lines.append(f"🗓 发布于：{release['published_at']}")
+        if self._repo_page:
+            lines.append(f"🔗 {self._repo_page}/releases")
+        body = [ln.strip() for ln in release["body"].splitlines() if ln.strip()]
+        if body:
+            lines.append(DIVIDER)
+            lines.extend(body[:6])
+        lines.append(DIVIDER)
+        lines.append(
+            "更新方式：AstrBot WebUI → 插件管理 → 本插件 → 更新"
+            "（由 AstrBot 覆盖插件目录，监控数据在 data/plugin_data 下不受影响）"
+        )
+        return "\n".join(lines)
+
+    async def _check_plugin_update(self, session: aiohttp.ClientSession, now: float):
+        """后台定期查版本；只在有新版本且没提醒过该版本时投送一次，避免每次轮询刷屏。"""
+        self._next_update_check = (
+            now
+            + max(
+                1,
+                self._conf_int(
+                    "update_check_interval_hours", DEFAULT_UPDATE_INTERVAL_HOURS
+                ),
+            )
+            * 3600
+        )
+        if not self._repo_slug or not self.version:
+            self.logger.warning("metadata.yaml 缺少 version 或 repo，跳过更新检查")
+            return
+        try:
+            item = self._pick_release(await self._fetch_releases(session))
+        except Exception as e:
+            self.logger.warning(f"检查插件更新失败: {e}")
+            return
+        if not item:
+            self.logger.warning("GitHub 仓库上没有可用的正式版 Release")
+            return
+        release = self._release_info(item)
+        if not version_is_newer(release["version"], self.version):
+            return
+        if self._update_hint_version == release["version"]:
+            return
+        self._update_hint_version = release["version"]
+        sent = await self._deliver(self._update_text(release, "🆕 直播监控插件可更新"))
+        if sent:
+            self.logger.info(
+                f"发现新版本 {release['version']}（当前 v{self.version}），已提醒 {sent} 个审核会话"
+            )
+        else:
+            self.logger.info(
+                f"发现新版本 {release['version']}（当前 v{self.version}），"
+                "但没有审核会话可提醒，管理员请用 /直播监控 检查更新 查看"
+            )
+
+    @monitor_group.command("检查更新")
+    async def cmd_check_update(self, event):
+        """检查插件是否有新版本。用法: /直播监控 检查更新"""
+        if deny := self._admin_only(event):
+            yield deny
+            return
+        if not self._repo_slug or not self.version:
+            yield event.plain_result(
+                "metadata.yaml 里没有可用的 version / repo，无法检查更新。"
+            )
+            return
+        try:
+            async with aiohttp.ClientSession() as session:
+                item = self._pick_release(await self._fetch_releases(session))
+        except Exception as e:
+            yield event.plain_result(f"检查更新失败: {e}")
+            return
+        if not item:
+            yield event.plain_result(
+                f"{self._repo_page} 上还没有正式版 Release，无法比较版本。"
+            )
+            return
+        release = self._release_info(item)
+        if not version_is_newer(release["version"], self.version):
+            yield event.plain_result(
+                f"当前 v{self.version} 已是最新版本（仓库最新正式版：{release['version']}）。"
+            )
+            return
+        # 手动查过就视为已提醒，避免后台再推一遍同样的内容
+        self._update_hint_version = release["version"]
+        yield event.plain_result(self._update_text(release, "🆕 发现新版本"))
+
     @monitor_group.command("帮助")
     async def cmd_help(self, event):
         """查看直播监控帮助"""
@@ -888,6 +1081,7 @@ class LiveMonitorPlugin(Star):
             "投稿列表  查看待审核投稿（管理员）\n"
             "投稿通过 <编号> / 投稿拒绝 <编号> [原因]  处理投稿（管理员，原因不能含空格）\n"
             "审核订阅 / 审核取消  让本会话接收（或停止接收）投稿推送（管理员）\n"
+            "检查更新  立即查一次 GitHub 上有没有新版插件（管理员）\n"
             "支持平台: B站直播(bili)、斗鱼(douyu)、虎牙(huya/hy)、抖音(douyin)\n"
             "开播/关播会自动推送主播名、房间号、标题、链接与封面。\n"
             "除 投稿/列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
@@ -930,6 +1124,10 @@ class LiveMonitorPlugin(Star):
         try:
             while True:
                 now = time.monotonic()
+                if self.conf.get("update_check", True) and (
+                    now >= self._next_update_check
+                ):
+                    await self._check_plugin_update(session, now)
                 due = []
                 for key, room in self.rooms.items():
                     if not room["watchers"]:

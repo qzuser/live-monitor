@@ -40,5 +40,15 @@
     "type": "string",
     "secret": true,
     "default": ""
+  },
+  "update_check": {
+    "description": "是否自动检查插件新版本。开启后插件会按下面的间隔查 GitHub Releases，发现新版就投送给审核会话提醒一次（同一版本只提醒一次）；关闭后仍可用 /直播监控 检查更新 手动查",
+    "type": "bool",
+    "default": true
+  },
+  "update_check_interval_hours": {
+    "description": "自动检查新版本的间隔（小时）。插件启动约 1 分钟后做第一次检查，之后按此间隔轮询。最小生效 1 小时，过小会被 GitHub API 限流",
+    "type": "int",
+    "default": 24
   }
 }

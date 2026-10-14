@@ -2,234 +2,25 @@
 
 运行：python tests/test_submission.py
 
-不发网络请求、不依赖 AstrBot：先往 sys.modules 注入 astrbot 桩模块，
-再导入插件 main.py，用假的 event / context 直接驱动指令处理函数。
+桩模块与构造助手放在 stubs.py（两个测试脚本共用），这里只写投稿相关用例。
 """
 
 import asyncio
-import json
-import sys
-import types
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-
-class Plain:
-    def __init__(self, text):
-        self.text = text
-
-    def __repr__(self):
-        return f"Plain({self.text!r})"
-
-
-class Image:
-    def __init__(self, data=""):
-        self.base64 = data
-
-    @classmethod
-    def fromBase64(cls, data):
-        return cls(data)
-
-
-class MessageChain:
-    def __init__(self, comps=None):
-        self.chain = list(comps or [])
-
-
-class _Filter:
-    @staticmethod
-    def command_group(name, alias=None):
-        def deco(func):
-            def command(sub_name):
-                def inner(handler):
-                    return handler
-
-                return inner
-
-            func.command = command
-            return func
-
-        return deco
-
-
-class Logger:
-    def __init__(self):
-        self.messages = []
-
-    def _log(self, level, msg):
-        self.messages.append((level, msg))
-
-    def info(self, msg):
-        self._log("info", msg)
-
-    def warning(self, msg):
-        self._log("warning", msg)
-
-    def error(self, msg):
-        self._log("error", msg)
-
-
-class Context:
-    def __init__(self, fail=()):
-        self.sent = []
-        self.fail = set(fail)
-
-    async def send_message(self, umo, chain):
-        if umo in self.fail:
-            raise RuntimeError("模拟主动消息失败")
-        self.sent.append((umo, chain))
-
-    def texts(self, umo=None):
-        return [
-            (target, comp.text)
-            for target, chain in self.sent
-            for comp in chain.chain
-            if isinstance(comp, Plain) and (umo is None or target == umo)
-        ]
-
-
-class Star:
-    def __init__(self, context):
-        self.context = context
-        self.logger = Logger()
-
-
-class StarTools:
-    data_dir = Path(".")
-
-    @classmethod
-    def get_data_dir(cls):
-        cls.data_dir.mkdir(parents=True, exist_ok=True)
-        return cls.data_dir
-
-
-def _install_stubs():
-    astrbot = types.ModuleType("astrbot")
-    api = types.ModuleType("astrbot.api")
-    event_mod = types.ModuleType("astrbot.api.event")
-    event_mod.MessageChain = MessageChain
-    event_mod.filter = _Filter
-    comps = types.ModuleType("astrbot.api.message_components")
-    comps.Image = Image
-    comps.Plain = Plain
-    star_mod = types.ModuleType("astrbot.api.star")
-    star_mod.Context = Context
-    star_mod.Star = Star
-    star_mod.StarTools = StarTools
-    for name, mod in {
-        "astrbot": astrbot,
-        "astrbot.api": api,
-        "astrbot.api.event": event_mod,
-        "astrbot.api.message_components": comps,
-        "astrbot.api.star": star_mod,
-    }.items():
-        sys.modules[name] = mod
-    for parent, child in (
-        (astrbot, api),
-        (api, event_mod),
-        (api, comps),
-        (api, star_mod),
-    ):
-        setattr(parent, child.__name__.split(".")[-1], child)
-
-
-_install_stubs()
-
-if "aiohttp" in sys.modules:
-    aiohttp = sys.modules["aiohttp"]
-else:
-    aiohttp = types.ModuleType("aiohttp")
-
-    class ClientSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-    class ClientTimeout:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    aiohttp.ClientSession = ClientSession
-    aiohttp.ClientTimeout = ClientTimeout
-    sys.modules["aiohttp"] = aiohttp
-
-import main  # noqa: E402  必须在桩模块之后导入
-
-
-async def fake_bilibili(session, room_id, cookie=""):
-    room_id = str(room_id)
-    if room_id == "999":
-        raise main.RoomCheckError("bilibili 接口返回 code=200，房间号可能不存在")
-    return {
-        "live": room_id == "6",
-        "title": f"直播标题{room_id}",
-        "anchor": f"主播{room_id}",
-        "anchor_uid": "",
-        "cover": "",
-        "url": f"https://live.bilibili.com/{room_id}",
-    }
-
-
-main.CHECKERS["bilibili"] = fake_bilibili
-
-
-async def _noop_poll(self):
-    await asyncio.sleep(3600)
-
-
-main.LiveMonitorPlugin._poll_loop = _noop_poll
-
-
-class FakeEvent:
-    def __init__(self, umo, sender_id=None, sender_name=None):
-        self.unified_msg_origin = umo
-        self._sender_id = sender_id or umo.split(":")[-1]
-        self._sender_name = sender_name or f"昵称-{umo.split(':')[-1]}"
-
-    def plain_result(self, text):
-        return types.SimpleNamespace(text=text)
-
-    def get_sender_id(self):
-        return self._sender_id
-
-    def get_sender_name(self):
-        return self._sender_name
-
-
-async def run(handler, *args):
-    return [res.text async for res in handler(*args)]
-
-
-def build(tmp, conf=None, fail=()):
-    StarTools.data_dir = Path(tmp)
-    return main.LiveMonitorPlugin(Context(fail=fail), conf or {})
-
-
-def write_data(tmp, payload):
-    Path(tmp, "rooms.json").write_text(
-        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def read_data(tmp):
-    return json.loads(Path(tmp, "rooms.json").read_text(encoding="utf-8"))
-
-
-ADMIN_UMO = "aiocqhttp:GroupMessage:1001"
-USER_UMO = "aiocqhttp:GroupMessage:2002"
-BILI_6 = "https://live.bilibili.com/6"
-
-
-def admin():
-    return FakeEvent(ADMIN_UMO)
-
-
-def user():
-    return FakeEvent(USER_UMO)
+import tempfile
+
+from stubs import (
+    ADMIN_UMO,
+    BILI_6,
+    USER_UMO,
+    FakeEvent,
+    admin,
+    build,
+    main,
+    read_data,
+    run,
+    user,
+    write_data,
+)
 
 
 async def test_legacy_data_upgraded(tmp):
@@ -481,8 +272,6 @@ async def test_poll_loop_still_works(tmp):
 
 
 async def main_test():
-    import tempfile
-
     tests = [
         ("旧版数据升级", test_legacy_data_upgraded),
         ("投稿投送给审核会话", test_submit_is_delivered_to_reviewers),
@@ -514,4 +303,4 @@ async def main_test():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main_test()))
+    raise SystemExit(asyncio.run(main_test()))
