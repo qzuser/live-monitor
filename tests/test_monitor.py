@@ -8,8 +8,10 @@
 """
 
 import asyncio
+import base64
 import tempfile
 import time
+from pathlib import Path
 
 # 必须先导入 stubs（它会替换 sys.modules 里的 aiohttp），再导入 aiohttp
 from stubs import (  # noqa: E402
@@ -774,6 +776,148 @@ async def test_last_live_at_survives_reload_and_dirty_data(tmp):
     assert restored.rooms["bilibili:9"]["last_live_at"] == 0
 
 
+# ---------- 安全与健壮性（代码审查后补的用例） ----------
+
+
+async def test_room_id_charset_rejects_url_injection(tmp):
+    """房间号会拼进请求 URL，"平台:房间号" 的写法与手工数据都得挡住 & ? / #。"""
+    assert main.parse_room_input("bilibili:6") == ("bilibili", "6", False)
+    assert main.parse_room_input("huya:abc-1_2") == ("huya", "abc-1_2", False)
+    for bad in (
+        "bilibili:6&admin=1",
+        "bilibili:../../x",
+        "bilibili:6?x=1",
+        "斗鱼:abc#1",
+    ):
+        assert main.parse_room_input(bad) is None, bad
+    assert main.valid_room_id("douyin", "1" * 30) is False
+
+    plugin = build(tmp)
+    kept = plugin._sanitize(
+        {
+            "bilibili:6": room_record(room_id="6"),
+            "bilibili:x": room_record(room_id="6 or 1=1"),
+            "bilibili:y": room_record(room_id="6?callback=1"),
+        }
+    )
+    assert list(kept) == ["bilibili:6"]
+    assert "房间号含非法字符" in "".join(m for _, m in plugin.logger.messages)
+    assert "无法识别" in (await run(plugin.cmd_add, admin(), "bilibili:6&admin=1"))[0]
+
+
+class _ImgResp:
+    def __init__(self, data=b"fake-image"):
+        self.status = 200
+        self.content_type = "image/jpeg"
+        self.content_length = len(data)
+        self._data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def read(self):
+        return self._data
+
+
+class _ImgHttp:
+    """记录封面请求的 URL 与请求头，返回固定图片字节。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _ImgResp()
+
+
+async def test_login_cookie_only_goes_to_bilibili(tmp):
+    """封面地址可能被手工编辑过，登录 Cookie 不能跟着发给任意站点。"""
+    plugin = build(tmp, {"bilibili_cookie": "SESSDATA=x"})
+    room = room_record()
+    http = _ImgHttp()
+
+    data = await plugin._fetch_cover_base64(http, room, "https://i0.hdslb.com/a.jpg")
+    assert data == base64.b64encode(b"fake-image").decode()
+    assert http.calls[0][1]["headers"]["Cookie"] == "SESSDATA=x"
+
+    for url in ("https://example.com/a.jpg", "https://hdslb.com.evil.net/a.jpg"):
+        await plugin._fetch_cover_base64(http, room, url)
+        assert "Cookie" not in http.calls[-1][1]["headers"], url
+
+    plugin.conf["bilibili_cookie"] = ""
+    assert plugin._cookie_for("https://i0.hdslb.com/a.jpg") == ""
+
+
+async def test_corrupt_data_is_quarantined(tmp):
+    """手工编辑写坏一个逗号不能静默清空：原文件改名留底，修好后重载即可恢复。"""
+    Path(tmp, "rooms.json").write_text('{"version": 3, "rooms": {,,}', encoding="utf-8")
+    plugin = build(tmp)
+    assert plugin.rooms == {} and plugin.ups == {}
+
+    bad = list(Path(tmp).glob("rooms.json.bad-*"))
+    assert len(bad) == 1, plugin.logger.messages
+    assert "{,," in bad[0].read_text(encoding="utf-8")
+    assert not Path(tmp, "rooms.json").exists()
+    logs = "".join(m for _, m in plugin.logger.messages)
+    assert "读取监控数据失败" in logs and "损坏的监控数据已改名保留" in logs
+
+
+async def test_save_is_atomic(tmp):
+    """保存先写临时文件再改名：序列化炸了也不能留下半个 rooms.json。"""
+    plugin = build(tmp)
+    plugin.rooms["bilibili:6"] = room_record()
+    plugin._save()
+    good = Path(tmp, "rooms.json").read_text(encoding="utf-8")
+    assert not Path(tmp, "rooms.json.tmp").exists()
+    assert read_data(tmp)["rooms"]["bilibili:6"]["watchers"] == {USER_UMO: "订阅者"}
+
+    plugin.rooms["bilibili:6"]["watchers"] = {object(): "订阅者"}  # JSON 序列化不了
+    plugin._save()
+    assert Path(tmp, "rooms.json").read_text(encoding="utf-8") == good
+    assert not Path(tmp, "rooms.json.tmp").exists()
+    assert "保存监控数据失败" in "".join(m for _, m in plugin.logger.messages)
+
+
+async def test_watcherless_room_loses_live_baseline(tmp):
+    """没人订阅就不会再被轮询，上次在播时刻要一并清掉，否则重新订阅后显示假间隔。"""
+    plugin = build(tmp)
+    plugin.rooms["bilibili:6"] = room_record(last_live_at=1760000000)
+    plugin.rooms["bilibili:6"]["watchers"][ADMIN_UMO] = "管理员"
+
+    assert "已取消" in (await run(plugin.cmd_unsub, user(), "6"))[0]
+    assert plugin.rooms["bilibili:6"]["last_live_at"] == 1760000000
+
+    assert "已取消" in (await run(plugin.cmd_unsub, admin(), "6"))[0]
+    assert plugin.rooms["bilibili:6"]["watchers"] == {}
+    assert plugin.rooms["bilibili:6"]["last_live_at"] == 0
+
+    cleaned = plugin._sanitize(
+        {"bilibili:6": room_record(last_live_at=1760000000, watchers={})}
+    )
+    assert cleaned["bilibili:6"]["last_live_at"] == 0
+
+
+async def test_poll_loop_survives_round_error(tmp):
+    """单轮的意外异常必须咽下去：后台任务一退出，所有监控就静默停了。"""
+    plugin = build(tmp, poll=True)
+
+    async def boom(session):
+        raise RuntimeError("模拟本轮检查炸掉")
+
+    plugin._poll_once = boom
+    try:
+        assert await wait_until(
+            lambda: any("本轮监控检查异常" in m for _, m in plugin.logger.messages)
+        ), plugin.logger.messages
+        assert any(level == "error" for level, _ in plugin.logger.messages)
+        assert not main._poll_task.done()
+    finally:
+        await stop_poll(main._poll_task)
+
+
 async def test_room_flow_untouched(tmp):
     """移除投稿不能影响原有直播间监控/通知路径。"""
     plugin = build(tmp)
@@ -813,6 +957,12 @@ async def main_test():
         ("间隔开关同时管两处", test_elapsed_switch_off_hides_both_fields),
         ("开播通知距离上次直播", test_live_notify_shows_since_last_live),
         ("上次在播时刻持久化", test_last_live_at_survives_reload_and_dirty_data),
+        ("房间号字符集校验", test_room_id_charset_rejects_url_injection),
+        ("登录Cookie只发B站域名", test_login_cookie_only_goes_to_bilibili),
+        ("损坏数据改名留底", test_corrupt_data_is_quarantined),
+        ("原子保存不留半个文件", test_save_is_atomic),
+        ("无订阅者清掉在播基线", test_watcherless_room_loses_live_baseline),
+        ("轮询单轮异常不退出", test_poll_loop_survives_round_error),
         ("关稿件通知仍记基线", test_notify_upload_off_still_tracks_baseline),
         ("稿件通知走白名单", test_upload_notify_respects_whitelist),
         ("封面失败降级纯文字", test_cover_failure_still_sends_text),

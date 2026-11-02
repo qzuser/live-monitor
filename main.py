@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import json
+import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api.event import MessageChain, filter
@@ -80,6 +82,20 @@ PREFIX_MAP = {
 
 BILI_SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)", re.IGNORECASE)
 BILI_LIVE_URL_RE = re.compile(r"live\.bilibili\.com", re.IGNORECASE)
+
+# 各平台房间号的合法字符。链接解析出来的天然满足，但 "平台:房间号" 的写法与手工编辑
+# 过的 rooms.json 必须自己校验：房间号会被拼进请求 URL，放过 & ? / # 就等于让外人
+# 改写查询串和路径。
+ROOM_ID_RE = {
+    "bilibili": re.compile(r"\d{1,15}"),
+    "douyin": re.compile(r"\d{1,20}"),
+    "douyu": re.compile(r"[A-Za-z0-9]{1,32}"),
+    "huya": re.compile(r"[A-Za-z0-9_-]{1,48}"),
+}
+
+# 登录 Cookie 只发给B站自己的域名：封面地址来自接口，也可能被手工改过，
+# 不加限制就等于把登录态转发给任意站点。
+BILI_COOKIE_HOSTS = ("bilibili.com", "bilibili.cn", "hdslb.com")
 
 
 class RoomCheckError(Exception):
@@ -404,7 +420,13 @@ def parse_room_input(text: str):
     text = str(text).strip()
     m = EXPLICIT_PREFIX.match(text)
     if m:
-        return PREFIX_MAP[m.group(1).lower()], m.group(2).strip(), False
+        platform = PREFIX_MAP[m.group(1).lower()]
+        room_id = m.group(2).strip()
+        # 前缀写法的房间号是用户原样给的，必须校验；链接解析出来的已经被
+        # URL_PATTERNS 限过字符集了
+        if not valid_room_id(platform, room_id):
+            return None
+        return platform, room_id, False
     for platform, pattern in URL_PATTERNS:
         m = pattern.search(text)
         if m:
@@ -418,6 +440,12 @@ def parse_room_input(text: str):
 
 def room_key(platform: str, room_id: str) -> str:
     return f"{platform}:{room_id}"
+
+
+def valid_room_id(platform: str, room_id: str) -> bool:
+    """房间号是否只含该平台允许的字符；不合法就不进监控表，也不拼进请求 URL。"""
+    pattern = ROOM_ID_RE.get(platform)
+    return bool(pattern) and bool(pattern.fullmatch(str(room_id)))
 
 
 def parse_up_input(text) -> str | None:
@@ -538,6 +566,24 @@ class LiveMonitorPlugin(Star):
             self.logger.warning(f"读取监控数据失败: {e}")
             self.rooms = {}
             self.ups = {}
+            self._quarantine_data_file(e)
+
+    def _quarantine_data_file(self, error):
+        """把读不了的 rooms.json 改名留底。原地留着的话，下一次 _save 会直接覆盖，
+        手工编辑写错一个逗号就等于把全部监控和订阅清空。"""
+        try:
+            if not self.data_file.exists():
+                return
+            bad = self.data_file.with_name(
+                f"rooms.json.bad-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            os.replace(self.data_file, bad)
+            self.logger.warning(
+                f"损坏的监控数据已改名保留为 {bad.name}（原因: {error}），"
+                "修好该文件后重载插件即可恢复"
+            )
+        except Exception as e:
+            self.logger.warning(f"保留损坏的监控数据失败: {e}")
 
     def _sanitize(self, raw) -> dict:
         """校验 rooms.json。手工编辑过的数据可能缺字段、类型不对，甚至 platform
@@ -558,8 +604,14 @@ class LiveMonitorPlugin(Star):
             if not room_id:
                 self.logger.warning(f"房间 {key} 缺少 room_id，已跳过")
                 continue
+            if not valid_room_id(platform, room_id):
+                self.logger.warning(f"房间 {key} 房间号含非法字符: {room_id}，已跳过")
+                continue
             watchers = self._sanitize_sessions(room.get("watchers"))
             live = room.get("live")
+            # 没有订阅者的房间不会被轮询，留着上次在播时刻只会在重新订阅后
+            # 显示一个误导性的"距离上次直播"
+            last_live_at = _as_int(room.get("last_live_at")) if watchers else 0
             rooms[str(key)] = {
                 "platform": platform,
                 "room_id": room_id,
@@ -570,7 +622,7 @@ class LiveMonitorPlugin(Star):
                 "live": live if live in (True, False) else None,
                 "fails": 0,
                 "watchers": watchers,
-                "last_live_at": _as_int(room.get("last_live_at")),
+                "last_live_at": last_live_at,
             }
         return rooms
 
@@ -608,10 +660,14 @@ class LiveMonitorPlugin(Star):
         payload = {"version": 3, "rooms": self.rooms, "ups": self.ups}
         try:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
-            self.data_file.write_text(
+            # 先写临时文件再改名覆盖：直接 write_text 若在写一半时崩溃，
+            # 留下的半个 JSON 会让下一次载入把数据当成空的
+            tmp = self.data_file.with_name(self.data_file.name + ".tmp")
+            tmp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            os.replace(tmp, self.data_file)
         except Exception as e:
             self.logger.warning(f"保存监控数据失败: {e}")
 
@@ -790,7 +846,12 @@ class LiveMonitorPlugin(Star):
         if not key:
             yield event.plain_result("未找到该监控房间，可先用 /直播监控 列表 查看。")
             return
-        self.rooms[key]["watchers"].pop(event.unified_msg_origin, None)
+        room = self.rooms[key]
+        room["watchers"].pop(event.unified_msg_origin, None)
+        if not room["watchers"]:
+            # 没人订阅就不会再被轮询，上次在播的时刻一并清零，
+            # 免得以后重新订阅时显示一个假的"距离上次直播"
+            room["last_live_at"] = 0
         self._save()
         yield event.plain_result("已取消本会话对该房间的通知。")
 
@@ -1177,61 +1238,65 @@ class LiveMonitorPlugin(Star):
         session = aiohttp.ClientSession()
         try:
             while True:
-                now = time.monotonic()
-                if self.conf.get("update_check", True) and (
-                    now >= self._next_update_check
-                ):
-                    await self._check_plugin_update(session, now)
-                due = []
-                for key, room in self.rooms.items():
-                    if not room["watchers"]:
-                        continue
-                    if now - self._last_check.get(key, 0) >= self._room_interval(room):
-                        due.append(key)
-                for key in due:
-                    room = self.rooms.get(key)
-                    if not room:
-                        continue
-                    try:
-                        await self._check_room(session, room)
-                        room["fails"] = 0
-                    except Exception as e:
-                        room["fails"] = room.get("fails", 0) + 1
-                        if room["fails"] in (1, 10) or room["fails"] % 30 == 0:
-                            self.logger.warning(
-                                f"检查房间 {key} 失败(第{room['fails']}次): {e}"
-                            )
-                    finally:
-                        self._last_check[key] = time.monotonic()
-                    await asyncio.sleep(1)
-                up_interval = self._upload_interval()
-                due_ups = []
-                for mid, up in self.ups.items():
-                    if not up["watchers"]:
-                        continue
-                    if now - self._last_check.get(f"up:{mid}", 0) >= up_interval:
-                        due_ups.append(mid)
-                for mid in due_ups:
-                    up = self.ups.get(mid)
-                    if not up:
-                        continue
-                    try:
-                        await self._check_up(session, up)
-                        up["fails"] = 0
-                    except Exception as e:
-                        up["fails"] = up.get("fails", 0) + 1
-                        if up["fails"] in (1, 10) or up["fails"] % 30 == 0:
-                            self.logger.warning(
-                                f"检查UP主 {mid} 失败(第{up['fails']}次): {e}"
-                            )
-                    finally:
-                        self._last_check[f"up:{mid}"] = time.monotonic()
-                    await asyncio.sleep(1)
+                try:
+                    await self._poll_once(session)
+                except Exception as e:
+                    # 单轮的意外异常必须咽下去：后台任务一退出，所有房间和UP主的
+                    # 监控就静默停了，而且不会再有任何通知
+                    self.logger.error(f"本轮监控检查异常，5 秒后继续: {e!r}")
                 await asyncio.sleep(5)
         except asyncio.CancelledError:
             pass
         finally:
             await session.close()
+
+    async def _poll_once(self, session: aiohttp.ClientSession):
+        now = time.monotonic()
+        if self.conf.get("update_check", True) and (now >= self._next_update_check):
+            await self._check_plugin_update(session, now)
+        due = []
+        for key, room in self.rooms.items():
+            if not room["watchers"]:
+                continue
+            if now - self._last_check.get(key, 0) >= self._room_interval(room):
+                due.append(key)
+        for key in due:
+            room = self.rooms.get(key)
+            if not room:
+                continue
+            try:
+                await self._check_room(session, room)
+                room["fails"] = 0
+            except Exception as e:
+                room["fails"] = room.get("fails", 0) + 1
+                if room["fails"] in (1, 10) or room["fails"] % 30 == 0:
+                    self.logger.warning(
+                        f"检查房间 {key} 失败(第{room['fails']}次): {e}"
+                    )
+            finally:
+                self._last_check[key] = time.monotonic()
+            await asyncio.sleep(1)
+        up_interval = self._upload_interval()
+        due_ups = []
+        for mid, up in self.ups.items():
+            if not up["watchers"]:
+                continue
+            if now - self._last_check.get(f"up:{mid}", 0) >= up_interval:
+                due_ups.append(mid)
+        for mid in due_ups:
+            up = self.ups.get(mid)
+            if not up:
+                continue
+            try:
+                await self._check_up(session, up)
+                up["fails"] = 0
+            except Exception as e:
+                up["fails"] = up.get("fails", 0) + 1
+                if up["fails"] in (1, 10) or up["fails"] % 30 == 0:
+                    self.logger.warning(f"检查UP主 {mid} 失败(第{up['fails']}次): {e}")
+            finally:
+                self._last_check[f"up:{mid}"] = time.monotonic()
+            await asyncio.sleep(1)
 
     def _show_elapsed(self) -> bool:
         """通知里是否显示"距离上次…"字段：开播通知的距离上次直播、稿件通知的距离上次更新。"""
@@ -1356,13 +1421,27 @@ class LiveMonitorPlugin(Star):
             parts = re.split(r"[,，;；\s]+", str(raw))
         return {p.strip() for p in parts if p.strip()}
 
+    def _cookie_for(self, url: str) -> str:
+        """只有B站自己的域名才带登录 Cookie。
+
+        封面地址来自接口，也可能被手工编辑过，不加限制就等于把登录态发给任意站点。
+        """
+        cookie = str(self.conf.get("bilibili_cookie") or "")
+        if not cookie:
+            return ""
+        host = (urlparse(url).hostname or "").lower()
+        for domain in BILI_COOKIE_HOSTS:
+            if host == domain or host.endswith("." + domain):
+                return cookie
+        return ""
+
     async def _fetch_cover_base64(
         self, session: aiohttp.ClientSession, room: dict, cover: str
     ) -> str:
         if not cover.startswith(("http://", "https://")):
             raise RoomCheckError("封面地址不是 http(s) 链接")
         headers = (
-            _bili_headers(str(self.conf.get("bilibili_cookie") or ""))
+            _bili_headers(self._cookie_for(cover))
             if room["platform"] == "bilibili"
             else HEADERS
         )
