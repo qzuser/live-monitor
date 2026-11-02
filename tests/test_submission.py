@@ -193,6 +193,36 @@ async def test_room_number_as_int_param(tmp):
     assert plugin._resolve_key(123456) == "bilibili:123456"
 
 
+async def test_int_param_on_every_room_command(tmp):
+    """线上真实崩溃点：/直播监控 订阅 33214 的参数是 int，所有吃房间号/编号的指令都要兜住。"""
+    assert main.parse_room_input(33214) == ("bilibili", "33214", False)
+    plugin = build(tmp)
+    plugin.rooms["bilibili:33214"] = {
+        "platform": "bilibili",
+        "room_id": "33214",
+        "title": "",
+        "anchor": "",
+        "cover": "",
+        "url": "",
+        "live": None,
+        "watchers": {},
+        "fails": 0,
+    }
+    assert "已订阅" in (await run(plugin.cmd_sub, admin(), 33214))[0]
+    assert plugin.rooms["bilibili:33214"]["watchers"]
+    assert "已取消" in (await run(plugin.cmd_unsub, admin(), 33214))[0]
+    assert plugin.rooms["bilibili:33214"]["watchers"] == {}
+
+    # 投稿编号同样会是 int
+    await run(plugin.cmd_submit, user(), "bili:7")
+    assert "已通过投稿 #1" in (await run(plugin.cmd_approve, admin(), 1))[0]
+    assert plugin.rooms["bilibili:7"]["watchers"]
+    await run(plugin.cmd_submit, user(), "bili:8")
+    assert "已拒绝投稿 #2" in (await run(plugin.cmd_reject, admin(), 2, "重复"))[0]
+    assert "已删除监控" in (await run(plugin.cmd_del, admin(), 33214))[0]
+    assert "bilibili:33214" not in plugin.rooms
+
+
 async def test_reload_keeps_submissions(tmp):
     plugin = build(tmp)
     await run(plugin.cmd_review_on, admin())
@@ -284,6 +314,7 @@ async def main_test():
         ("同会话审核与编号不存在", test_approve_same_session_and_unknown_id),
         ("拒绝带原因回投", test_reject_notifies_submitter_with_reason),
         ("纯数字房间号参数", test_room_number_as_int_param),
+        ("int 参数覆盖全部指令", test_int_param_on_every_room_command),
         ("重载后投稿与审核会话保留", test_reload_keeps_submissions),
         ("脏投稿数据被清理", test_corrupted_submission_data_is_dropped),
         ("原轮询通知不受影响", test_poll_loop_still_works),

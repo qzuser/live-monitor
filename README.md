@@ -22,17 +22,19 @@
 
 ## 安装
 
-1. 下载本仓库（或复制 `live-monitor` 文件夹）
-2. 将整个 `live-monitor` 目录放入 AstrBot 的 `data/plugins/` 下：
+1. 下载本仓库，或下载 Release 页的 `live_monitor_v<版本>.zip`
+2. 把 `main.py`、`metadata.yaml`、`_conf_schema.json` 放进 AstrBot 的 `data/plugins/live_monitor/`（目录名用 `metadata.yaml` 里的 `name`，AstrBot 按它生成模块路径 `data.plugins.live_monitor.main`）：
 
    ```
-   data/plugins/live-monitor/
+   data/plugins/live_monitor/
    ├── main.py
    ├── metadata.yaml
    └── _conf_schema.json
    ```
 
 3. 在 AstrBot WebUI「插件管理」中重载插件并启用即可。
+
+> 从旧版本升级只需覆盖 `main.py`（`metadata.yaml`、`_conf_schema.json` 有新增配置项时一并覆盖）；监控数据在 `data/plugin_data/live_monitor/rooms.json`，不会被更新动到。
 
 > 依赖 `aiohttp`，AstrBot 已内置，无需额外安装。
 >
@@ -257,6 +259,7 @@
 2. 回复里写"推送给 N 个审核会话均失败" → 审核会话登记了但主动消息发不出去，日志里会是 `推送通知到 <UMO> 失败: ...`；"并投送给 N 个审核会话"的 N 比登记的少，也是同一类问题，按上一节排查（`qq_official` 不支持主动消息）。
 3. 管理员想处理积压但不记得编号 → `/直播监控 投稿列表`；`/直播监控 列表` 的管理员视角也会在末尾提示还有几条待审。
 4. 投稿通过了但群里没收到开播通知 → 通过时订阅的是**投稿人会话**和**审核者会话**，其他群需要各自 `订阅`。
+5. 日志里出现 `cmd_sub / cmd_del handle error: 'int' object has no attribute 'strip'` → 装的是 0.1.1 及以前的旧版。AstrBot 会把纯数字指令参数转成 `int`，旧版 `parse_room_input` / `_resolve_key` 直接 `.strip()` 就崩了；0.1.2 起做了字符串兜底，覆盖 `添加/删除/订阅/取消/投稿/投稿通过/投稿拒绝`，升级 `main.py` 即可。
 
 ## 封面图与发送容错
 
@@ -295,22 +298,24 @@
 
 | 版本 | 主要变更 |
 | --- | --- |
-| 0.1.2 | 新增**投稿投送**：`投稿`（所有人，先校验房间再投送审核会话）、`投稿列表`、`投稿通过`、`投稿拒绝 [原因]`、`审核订阅`、`审核取消`；待审数量防刷（单会话 3 条 / 全局 50 条）；新增**插件更新检查**（后台定期比对 GitHub Release 并提醒新版本，`检查更新` 手动查询，`update_check` 可关）；`rooms.json` 升级为 v2 结构并自动兼容 0.1.1 旧数据；修复纯数字房间号被 AstrBot 转成 `int` 导致 `添加 123456` 崩溃的问题；新增离线冒烟测试 `tests/run.py`（投稿、更新检查两套共 23 条） |
+| 0.1.2 | 新增**投稿投送**：`投稿`（所有人，先校验房间再投送审核会话）、`投稿列表`、`投稿通过`、`投稿拒绝 [原因]`、`审核订阅`、`审核取消`；待审数量防刷（单会话 3 条 / 全局 50 条）；新增**插件更新检查**（后台定期比对 GitHub Release 并提醒新版本，`检查更新` 手动查询，`update_check` 可关）；`rooms.json` 升级为 v2 结构并自动兼容 0.1.1 旧数据；修复纯数字房间号被 AstrBot 转成 `int` 导致 `添加 123456` 崩溃的问题；新增离线冒烟测试 `tests/run.py`（投稿、更新检查两套共 24 项） |
 | 0.1.1 | 修复多群只有第一个群能收到通知；封面改为本插件下载转 base64 复用，并加地址/状态码/Content-Type/体积四道校验；带图失败自动纯文字补发；白名单跳过写日志；`rooms.json` 载入校验修复；每个订阅会话使用独立消息链 |
 | 0.1.0 | 首个版本：四平台监控、聊天内指令管理、开播/关播推送、开关分开轮询间隔、通知白名单、管理员机制、数据持久化与热重载 |
 
 ## 开发与许可
 
-仓库：<https://github.com/qzuser/live-monitor>，Release 页提供打包好的 `live_monitor_v<版本>.zip`，下载后解压到 `data/plugins/live-monitor/` 即可。
+仓库：<https://github.com/qzuser/live-monitor>，Release 页提供打包好的 `live_monitor_v<版本>.zip`，下载后覆盖 `data/plugins/live_monitor/` 里的同名文件即可。
 
 代码见 `main.py`，按 AstrBot Star 插件规范开发（`filter.command_group` 注册指令、后台 `asyncio` 轮询、`context.send_message` 主动推送、`StarTools.get_data_dir()` 存数据、`terminate()` 清理任务）。
 
-离线冒烟测试（不需要 AstrBot、不联网，桩模块注入后直接驱动指令函数）：
+离线冒烟测试（不需要 AstrBot、不联网，`tests/stubs.py` 注入 astrbot / aiohttp 桩模块，用假 event 与假 context 直接驱动指令函数）：
 
 ```bash
-python tests/test_submission.py
+python tests/run.py                # 两套一起跑
+python tests/test_submission.py    # 投稿投送
+python tests/test_update_check.py  # 更新检查
 ```
 
-覆盖旧数据升级、投稿→投送→通过/拒绝、查重与防刷上限、纯数字参数、脏数据清理、以及原有开播推送路径不受影响。
+投稿套覆盖旧数据升级、投稿→投送→通过/拒绝、查重与防刷上限、纯数字参数（`订阅/取消/删除/投稿通过` 全部按 int 传一遍）、脏数据清理、原有开播推送路径不受影响；更新检查套覆盖版本号比较、跳过预发布 Release、同一版本只提醒一次、`update_check` 开关、检查失败不影响轮询。共 24 项用例。
 
 MIT License，可自由修改分发。
