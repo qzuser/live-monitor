@@ -238,6 +238,11 @@ async def fetch_up_uploads(
                 "url": f"https://www.bilibili.com/video/{bvid}",
             }
         )
+    # 接口按从新到旧返回，第 i 条的"上一条"就是更旧的第 i+1 条；
+    # 列表里最后一条没有参照，取不到时距离上次更新这一行会被省略
+    for idx, current in enumerate(uploads):
+        older = uploads[idx + 1] if idx + 1 < len(uploads) else None
+        current["prev_pubtime"] = older["pubtime"] if older else 0
     return uploads
 
 
@@ -250,7 +255,28 @@ def format_pubtime(pubtime: int) -> str:
         return "时间未知"
 
 
-def format_upload(up: dict, item: dict) -> str:
+def format_since(prev_ts, cur_ts=None) -> str:
+    """把"距上次"的间隔写成 xx天 / xx小时（不满一天按小时）。
+
+    取不到上次时间、缺少本次时间参照、或算出负数（时钟回拨、接口给的 pubtime 比
+    上一条还早）都返回空串，由调用方直接省略这一行，而不是显示 0天/未知。
+    """
+    prev = _as_int(prev_ts)
+    cur = _as_int(cur_ts) if cur_ts is not None else int(time.time())
+    if prev <= 0 or cur <= 0:
+        return ""
+    delta = cur - prev
+    if delta < 0:
+        return ""
+    hours = delta // 3600
+    if hours < 1:
+        return "不到1小时"
+    if hours < 24:
+        return f"{hours}小时"
+    return f"{hours // 24}天"
+
+
+def format_upload(up: dict, item: dict, since: str = "") -> str:
     """渲染单条新稿件通知。"""
     lines = [
         "📺 投稿通知",
@@ -260,19 +286,23 @@ def format_upload(up: dict, item: dict) -> str:
         f"🔖 稿件：{item['bvid']}",
         f"🕒 发布：{format_pubtime(item['pubtime'])}",
     ]
+    if since:
+        lines.append(f"⏳ 距上次更新：{since}")
     if item["url"]:
         lines.append(f"🔗 {item['url']}")
     return "\n".join(lines)
 
 
-def format_uploads_batch(up: dict, fresh: list, shown: list) -> str:
+def format_uploads_batch(up: dict, fresh: list, shown: list, since: str = "") -> str:
     """一次出现多条新稿件（UP 主批量补档）时合并成一条，避免刷屏。"""
     lines = [
         "📺 投稿通知",
         DIVIDER,
         f"👤 UP：{up['name'] or up['mid']}",
-        f"🆕 新增 {len(fresh)} 条稿件，列出最近 {len(shown)} 条：",
     ]
+    if since:
+        lines.append(f"⏳ 最新一条距上次更新：{since}")
+    lines.append(f"🆕 新增 {len(fresh)} 条稿件，列出最近 {len(shown)} 条：")
     for item in shown:
         lines.append(f"· {item['title'] or '(无标题)'}（{item['bvid']}）")
         lines.append(f"  {item['url']}")
@@ -540,6 +570,7 @@ class LiveMonitorPlugin(Star):
                 "live": live if live in (True, False) else None,
                 "fails": 0,
                 "watchers": watchers,
+                "last_live_at": _as_int(room.get("last_live_at")),
             }
         return rooms
 
@@ -888,6 +919,8 @@ class LiveMonitorPlugin(Star):
                 "live": None,
                 "watchers": {},
                 "fails": 0,
+                # 最近一次看到在播的时刻，用于开播通知里的"距离上次直播"；0 表示没有记录
+                "last_live_at": 0,
             }
             self.rooms[key] = room
         return room
@@ -1102,6 +1135,9 @@ class LiveMonitorPlugin(Star):
             "UP主稿件仅支持B站。\n"
             "开播/关播会推送主播名、房间号、标题、链接与封面；"
             "UP主发新稿件会推送标题、BV号、发布时间与封面。\n"
+            "插件配置 show_elapsed（默认开启）后，开播通知会带上距离上次直播的时间，"
+            "稿件通知会带上距上次更新的时间；不满一天按小时显示，"
+            "取不到上一次时间时这一行自动省略。\n"
             "除 列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
             "通知白名单：插件配置 notify_whitelist，填写允许接收通知的会话UMO，留空不限制。"
         )
@@ -1197,6 +1233,10 @@ class LiveMonitorPlugin(Star):
         finally:
             await session.close()
 
+    def _show_elapsed(self) -> bool:
+        """通知里是否显示"距离上次…"字段：开播通知的距离上次直播、稿件通知的距离上次更新。"""
+        return bool(self.conf.get("show_elapsed", True))
+
     def _upload_interval(self) -> int:
         return max(
             MIN_UPLOAD_INTERVAL,
@@ -1226,14 +1266,20 @@ class LiveMonitorPlugin(Star):
                 self._conf_int("upload_max_notify", DEFAULT_UPLOAD_MAX_NOTIFY),
             )
             shown = fresh[-cap:]
+            newest = fresh[-1]
+            since = (
+                format_since(newest.get("prev_pubtime"), newest.get("pubtime"))
+                if self._show_elapsed()
+                else ""
+            )
             if len(shown) == 1:
-                text = format_upload(up, shown[0])
+                text = format_upload(up, shown[0], since)
                 if len(fresh) > len(shown):
                     text += f"\n另有 {len(fresh) - len(shown)} 条新稿件未列出"
                 await self._notify(session, up, text, shown[0]["cover"])
             else:
                 await self._notify(
-                    session, up, format_uploads_batch(up, fresh, shown), ""
+                    session, up, format_uploads_batch(up, fresh, shown, since), ""
                 )
             self.logger.info(
                 f"UP主 {up['mid']}（{up['name']}）新增 {len(fresh)} 条稿件，已推送"
@@ -1258,11 +1304,16 @@ class LiveMonitorPlugin(Star):
 
         prev = room.get("live")
         now = result["live"]
+        now_ts = int(time.time())
+        # 先取本次之前的最后一次在播时刻，再刷新它，否则算出来的间隔永远是本轮询周期
+        last_live_at = _as_int(room.get("last_live_at"))
         room["title"] = result["title"] or room.get("title", "")
         room["anchor"] = result.get("anchor") or room.get("anchor", "")
         room["cover"] = result.get("cover") or room.get("cover", "")
         room["url"] = result["url"]
         room["live"] = now
+        if now is True:
+            room["last_live_at"] = now_ts
 
         if prev is None:
             # 首次检测只记录基线，不推送
@@ -1271,17 +1322,19 @@ class LiveMonitorPlugin(Star):
         anchor = room["anchor"] or room["room_id"]
         pname = PLATFORM_NAMES[platform]
         if prev is False and now is True and self.conf.get("notify_start", True):
-            text = (
-                "🔴 开播通知\n"
-                f"{DIVIDER}\n"
-                f"👤 主播：{anchor}\n"
-                f"📡 平台：{pname}\n"
-                f"🚪 房间：{room['room_id']}\n"
-                f"📺 标题：{result['title'] or '(无标题)'}\n"
-                f"{DIVIDER}\n"
-                f"🔗 {result['url']}"
-            )
-            await self._notify(session, room, text, room.get("cover", ""))
+            since = format_since(last_live_at, now_ts) if self._show_elapsed() else ""
+            lines = [
+                "🔴 开播通知",
+                DIVIDER,
+                f"👤 主播：{anchor}",
+                f"📡 平台：{pname}",
+                f"🚪 房间：{room['room_id']}",
+                f"📺 标题：{result['title'] or '(无标题)'}",
+            ]
+            if since:
+                lines.append(f"⏳ 距离上次直播：{since}")
+            lines += [DIVIDER, f"🔗 {result['url']}"]
+            await self._notify(session, room, "\n".join(lines), room.get("cover", ""))
         elif prev is True and now is False and self.conf.get("notify_end", True):
             text = (
                 "⚫ 关播通知\n"

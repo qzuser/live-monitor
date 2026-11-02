@@ -402,6 +402,13 @@ async def test_fetch_up_uploads_parses_payload(tmp):
                 {"bv_id": "", "upper": {"mid": 946974}},  # 没有 BV 号，丢弃
                 {"bv_id": "BV2", "upper": {"mid": 1}},  # 合集里别人的稿件，丢弃
                 "脏数据",
+                {
+                    "bv_id": "BV0",
+                    "title": "乙",
+                    "cover": "",
+                    "pubtime": 1759000000,
+                    "upper": {"mid": "946974"},
+                },
             ]
         },
     }
@@ -409,9 +416,15 @@ async def test_fetch_up_uploads_parses_payload(tmp):
     main.fetch_up_uploads = REAL_FETCH_UP_UPLOADS
     try:
         items = await main.fetch_up_uploads(http, "946974", cookie="SESSDATA=x")
-        assert [item["bvid"] for item in items] == ["BV1"]
+        assert [item["bvid"] for item in items] == ["BV1", "BV0"]
         assert items[0]["url"] == "https://www.bilibili.com/video/BV1"
         assert items[0]["title"] == "甲"
+        # 上一条投稿的时间用来算"距上次更新"；列表里最后一条没有参照，标 0
+        assert items[0]["prev_pubtime"] == 1759000000
+        assert items[1]["prev_pubtime"] == 0
+        assert (
+            main.format_since(items[0]["prev_pubtime"], items[0]["pubtime"]) == "11天"
+        )
         url, kwargs = http.calls[0]
         assert "x/v2/medialist/resource/list" in url and "biz_id=946974" in url
         assert "otype=2" in url and "ps=20" in url
@@ -556,6 +569,211 @@ async def test_upload_interval_clamped(tmp):
     assert plugin._upload_interval() == 900
 
 
+DAY = 86400
+
+
+def live_switch(live: bool):
+    """临时替换B站直播接口，返回原实现供用例结束后恢复。"""
+    origin = main.CHECKERS["bilibili"]
+
+    async def checker(session, room_id, cookie=""):
+        return {
+            "live": live,
+            "title": f"直播标题{room_id}",
+            "anchor": f"主播{room_id}",
+            "anchor_uid": "",
+            "cover": "",
+            "url": f"https://live.bilibili.com/{room_id}",
+        }
+
+    main.CHECKERS["bilibili"] = checker
+    return origin
+
+
+def use_uploads(items):
+    """按 (bvid, pubtime) 顶替稿件接口，像真实接口一样把上一条时间标回去。"""
+    origin = main.fetch_up_uploads
+    uploads = [upload_item(bvid, pubtime) for bvid, pubtime in items]
+    for idx, current in enumerate(uploads):
+        older = uploads[idx + 1] if idx + 1 < len(uploads) else None
+        current["prev_pubtime"] = older["pubtime"] if older else 0
+
+    async def fetch(session, mid, cookie="", limit=20):
+        return [dict(item) for item in uploads[:limit]]
+
+    main.fetch_up_uploads = fetch
+    return origin
+
+
+async def test_format_since_units(tmp):
+    """天/小时的分界，以及取不到参照时必须返回空串（由调用方省略整行）。"""
+    now = int(time.time())
+    assert main.format_since(now - 3 * DAY, now) == "3天"
+    assert main.format_since(now - DAY, now) == "1天"
+    assert main.format_since(now - 23 * 3600, now) == "23小时"
+    assert main.format_since(now - 5 * 3600, now) == "5小时"
+    assert main.format_since(now - 1800, now) == "不到1小时"
+    assert main.format_since(0, now) == ""  # 没有上次记录
+    assert main.format_since(None, now) == ""
+    assert main.format_since("abc", now) == ""
+    assert main.format_since(now + DAY, now) == ""  # 时间倒挂不显示负数
+    assert main.format_since(now - DAY, 0) == ""  # 缺本次参照
+    assert main.format_since(now - 2 * 86400 * 365, now) == "730天"
+
+
+async def test_upload_notify_shows_since_update(tmp):
+    """稿件通知里的"距上次更新"取新稿件与上一条投稿的时间差。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    up = add_up(plugin)
+    origin = use_uploads([("BV1", now - 3 * DAY)])
+    try:
+        await check_up(plugin, up)
+        assert plugin.context.sent == []  # 基线不推送
+
+        use_uploads([("BV2", now), ("BV1", now - 3 * DAY)])
+        await check_up(plugin, up)
+        text = plugin.context.texts(ADMIN_UMO)[-1][1]
+        assert "🔖 稿件：BV2" in text, text
+        assert "⏳ 距上次更新：3天" in text, text
+
+        # 只有一条稿件、拿不到上一条时间：整行省略，不能出现空字段
+        up["seen"] = ["BV2"]
+        use_uploads([("BV3", now + DAY)])
+        await check_up(plugin, up)
+        text = plugin.context.texts(ADMIN_UMO)[-1][1]
+        assert "🔖 稿件：BV3" in text and "⏳" not in text, text
+
+        use_uploads([("BV4", now + DAY), ("BV3", now + DAY - 5 * 3600)])
+        await check_up(plugin, up)
+        text = plugin.context.texts(ADMIN_UMO)[-1][1]
+        assert "⏳ 距上次更新：5小时" in text, text
+    finally:
+        main.fetch_up_uploads = origin
+
+
+async def test_batch_notify_since_uses_newest(tmp):
+    """合并推送按最新一条稿件算距上次更新，并且不能因为多一行而变成两条消息。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    up = add_up(plugin)
+    origin = use_uploads([("BV1", now - 6 * 3600)])
+    try:
+        await check_up(plugin, up)
+        use_uploads(
+            [
+                ("BV3", now),
+                ("BV2", now - 2 * 3600),
+                ("BV1", now - 6 * 3600),
+            ]
+        )
+        await check_up(plugin, up)
+        delivered = plugin.context.texts(ADMIN_UMO)
+        assert len(delivered) == 1, delivered
+        text = delivered[0][1]
+        assert "新增 2 条稿件，列出最近 2 条" in text, text
+        # BV3 的上一条是同样是新的 BV2，间隔按实际投稿时间差算，不是距基线
+        assert "⏳ 最新一条距上次更新：2小时" in text, text
+    finally:
+        main.fetch_up_uploads = origin
+
+
+async def test_elapsed_switch_off_hides_both_fields(tmp):
+    """show_elapsed 关掉后，稿件通知与开播通知都不再显示"距离上次"。"""
+    now = int(time.time())
+    plugin = build(tmp, conf={"show_elapsed": False})
+    up = add_up(plugin)
+    origin = use_uploads([("BV1", now - 3 * DAY)])
+    try:
+        await check_up(plugin, up)
+        use_uploads([("BV2", now), ("BV1", now - 3 * DAY)])
+        await check_up(plugin, up)
+        text = plugin.context.texts(ADMIN_UMO)[-1][1]
+        assert "🔖 稿件：BV2" in text and "⏳" not in text, text
+
+        plugin.rooms["bilibili:6"] = room_record(live=False, last_live_at=now - 2 * DAY)
+        swap = live_switch(True)
+        try:
+            async with aiohttp.ClientSession() as session:
+                await plugin._check_room(session, plugin.rooms["bilibili:6"])
+        finally:
+            main.CHECKERS["bilibili"] = swap
+        text = plugin.context.texts(USER_UMO)[-1][1]
+        assert "🔴 开播通知" in text and "⏳" not in text, text
+
+        # 重新打开就恢复显示
+        plugin.conf["show_elapsed"] = True
+        room = plugin.rooms["bilibili:6"]
+        room["live"] = False
+        room["last_live_at"] = now - 2 * DAY
+        async with aiohttp.ClientSession() as session:
+            await plugin._check_room(session, room)
+        assert "⏳ 距离上次直播：2天" in plugin.context.texts(USER_UMO)[-1][1]
+    finally:
+        main.fetch_up_uploads = origin
+
+
+async def test_live_notify_shows_since_last_live(tmp):
+    """开播通知显示距离上次直播，并持久化最后一次在播的时刻。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    plugin.rooms["bilibili:6"] = room_record(live=False)
+    swap = live_switch(True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            await plugin._check_room(session, plugin.rooms["bilibili:6"])
+            text = plugin.context.texts(USER_UMO)[-1][1]
+            assert "🔴 开播通知" in text, text
+            # 老数据里没有 last_live_at，取不到上次开播信息就不能显示这一行
+            assert "⏳" not in text, text
+            room = plugin.rooms["bilibili:6"]
+            assert room["last_live_at"] >= now
+
+            # 关播不显示该字段，但记录的时刻保留，供下次开播时计算
+            live_switch(False)
+            await plugin._check_room(session, room)
+            assert "⚫ 关播通知" in plugin.context.texts(USER_UMO)[-1][1]
+            assert room["last_live_at"] >= now
+            assert read_data(tmp)["rooms"]["bilibili:6"]["last_live_at"] >= now
+
+            room["last_live_at"] = now - 3 * DAY - 60
+            live_switch(True)
+            await plugin._check_room(session, room)
+            text = plugin.context.texts(USER_UMO)[-1][1]
+            assert "🔴 开播通知" in text, text
+            assert "⏳ 距离上次直播：3天" in text, text
+            assert text.index("📺 标题") < text.index("⏳ 距离上次直播")
+            assert text.index("⏳ 距离上次直播") < text.index("────────────────\n🔗")
+    finally:
+        main.CHECKERS["bilibili"] = swap
+
+
+async def test_last_live_at_survives_reload_and_dirty_data(tmp):
+    """重启后 last_live_at 要能读回来；脏值归零而不是让轮询崩掉。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    plugin.rooms["bilibili:6"] = room_record(live=False, last_live_at=now - DAY)
+    plugin._save()
+    assert build(tmp).rooms["bilibili:6"]["last_live_at"] == now - DAY
+
+    write_data(
+        tmp,
+        {
+            "version": 3,
+            "rooms": {
+                "bilibili:7": room_record(room_id="7", last_live_at="abc"),
+                "bilibili:8": room_record(room_id="8", last_live_at=None),
+                "bilibili:9": room_record(room_id="9"),
+            },
+            "ups": {},
+        },
+    )
+    restored = build(tmp)
+    assert restored.rooms["bilibili:7"]["last_live_at"] == 0
+    assert restored.rooms["bilibili:8"]["last_live_at"] == 0
+    assert restored.rooms["bilibili:9"]["last_live_at"] == 0
+
+
 async def test_room_flow_untouched(tmp):
     """移除投稿不能影响原有直播间监控/通知路径。"""
     plugin = build(tmp)
@@ -589,6 +807,12 @@ async def main_test():
         ("批量上限列最近几条", test_batch_cap_lists_recent_and_counts_rest),
         ("cap=1 不连发", test_single_notify_cap_keeps_one_message),
         ("单条稿件明细格式", test_one_new_upload_uses_detail_format),
+        ("距上次间隔格式", test_format_since_units),
+        ("稿件通知距上次更新", test_upload_notify_shows_since_update),
+        ("合并通知按最新条算间隔", test_batch_notify_since_uses_newest),
+        ("间隔开关同时管两处", test_elapsed_switch_off_hides_both_fields),
+        ("开播通知距离上次直播", test_live_notify_shows_since_last_live),
+        ("上次在播时刻持久化", test_last_live_at_survives_reload_and_dirty_data),
         ("关稿件通知仍记基线", test_notify_upload_off_still_tracks_baseline),
         ("稿件通知走白名单", test_upload_notify_respects_whitelist),
         ("封面失败降级纯文字", test_cover_failure_still_sends_text),

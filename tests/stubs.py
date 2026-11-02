@@ -218,18 +218,24 @@ async def fake_up_info(session, mid, cookie=""):
     return {"name": f"UP主{mid}", "face": "", "archive_count": 12}
 
 
-def upload_item(bvid, pubtime=1760000000):
+def upload_item(bvid, pubtime=1760000000, prev_pubtime=0):
     return {
         "bvid": bvid,
         "title": f"稿件{bvid}",
         "cover": "",
         "pubtime": pubtime,
         "url": f"https://www.bilibili.com/video/{bvid}",
+        "prev_pubtime": prev_pubtime,
     }
 
 
 async def fake_up_uploads(session, mid, cookie="", limit=20):
-    return [upload_item(bvid) for bvid in UPLOADS.get(str(mid), [])][:limit]
+    uploads = [upload_item(bvid) for bvid in UPLOADS.get(str(mid), [])][:limit]
+    # 与真实接口一致：上一条 = 列表里更旧的那条，最后一条没有参照
+    for idx, current in enumerate(uploads):
+        older = uploads[idx + 1] if idx + 1 < len(uploads) else None
+        current["prev_pubtime"] = older["pubtime"] if older else 0
+    return uploads
 
 
 main.fetch_up_info = fake_up_info

@@ -30,6 +30,11 @@
     "type": "bool",
     "default": true
   },
+  "show_elapsed": {
+    "description": "通知里是否显示“距离上次”的时间：开播通知显示距离上次直播、UP主稿件通知显示距离上次更新，不满一天按小时显示。取不到上一次的时间时该字段自动省略",
+    "type": "bool",
+    "default": true
+  },
   "upload_check_interval": {
     "description": "UP主稿件检查间隔（秒）。只对已添加的B站UP主生效，最小生效 60 秒，过小会被B站限流",
     "type": "int",
