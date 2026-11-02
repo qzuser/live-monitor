@@ -1,6 +1,6 @@
 """离线测试用的 astrbot / aiohttp 桩模块与插件构造助手。
 
-两个测试脚本（test_submission.py、test_update_check.py）共用：注入桩模块 →
+两个测试脚本（test_monitor.py、test_update_check.py）共用：注入桩模块 →
 导入插件 main.py → 用假的 event / context 驱动指令处理函数，全程不联网、
 不需要安装 AstrBot。
 """
@@ -141,8 +141,14 @@ def _install_astrbot_stubs():
 
 
 def _install_aiohttp_stub():
-    if "aiohttp" in sys.modules:
-        return sys.modules["aiohttp"]
+    """强制换成桩 aiohttp。
+
+    测试脚本里 `import aiohttp` 的顺序不确定，若已经有真实 aiohttp 在 sys.modules
+    里就不替换的话，用例可能真的去发网络请求，结果随网络状态飘。
+    """
+    existing = sys.modules.get("aiohttp")
+    if getattr(existing, "__qoder_offline_stub__", False):
+        return existing
     aiohttp = types.ModuleType("aiohttp")
 
     class ClientSession:
@@ -164,6 +170,7 @@ def _install_aiohttp_stub():
 
     aiohttp.ClientSession = ClientSession
     aiohttp.ClientTimeout = ClientTimeout
+    aiohttp.__qoder_offline_stub__ = True
     sys.modules["aiohttp"] = aiohttp
     return aiohttp
 
@@ -196,6 +203,37 @@ async def fake_bilibili(session, room_id, cookie=""):
 
 
 main.CHECKERS["bilibili"] = fake_bilibili
+
+REAL_FETCH_UP_INFO = main.fetch_up_info
+REAL_FETCH_UP_UPLOADS = main.fetch_up_uploads
+
+# mid -> [bv_id 从新到旧]，未登记的 mid 视为没有稿件
+UPLOADS = {}
+
+
+async def fake_up_info(session, mid, cookie=""):
+    """替掉B站 UP 主校验接口：mid 999 视为不存在。"""
+    if str(mid) == "999":
+        raise main.RoomCheckError("bilibili 接口返回 code=-352，mid 可能不存在")
+    return {"name": f"UP主{mid}", "face": "", "archive_count": 12}
+
+
+def upload_item(bvid, pubtime=1760000000):
+    return {
+        "bvid": bvid,
+        "title": f"稿件{bvid}",
+        "cover": "",
+        "pubtime": pubtime,
+        "url": f"https://www.bilibili.com/video/{bvid}",
+    }
+
+
+async def fake_up_uploads(session, mid, cookie="", limit=20):
+    return [upload_item(bvid) for bvid in UPLOADS.get(str(mid), [])][:limit]
+
+
+main.fetch_up_info = fake_up_info
+main.fetch_up_uploads = fake_up_uploads
 
 
 async def _idle_poll(self):

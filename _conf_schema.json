@@ -30,19 +30,34 @@
     "type": "bool",
     "default": true
   },
+  "upload_check_interval": {
+    "description": "UP主稿件检查间隔（秒）。只对已添加的B站UP主生效，最小生效 60 秒，过小会被B站限流",
+    "type": "int",
+    "default": 300
+  },
+  "notify_upload": {
+    "description": "UP主发布新稿件时是否推送通知。关闭后仍会继续记录稿件基线，重新开启不会补推送历史稿件",
+    "type": "bool",
+    "default": true
+  },
+  "upload_max_notify": {
+    "description": "一次检查最多推送几条新稿件。超过则合并成一条列表消息，防止UP主批量补档时刷屏",
+    "type": "int",
+    "default": 3
+  },
   "notify_whitelist": {
     "description": "通知白名单（会话UMO），多个用逗号分隔；留空则不限制、推送给所有订阅会话。UMO可在 /直播监控 列表(管理员) 或日志中查看，如 aiocqhttp:GroupMessage:123456789",
     "type": "text",
     "default": ""
   },
   "bilibili_cookie": {
-    "description": "B站直播 Cookie（可选，监控无头信息接口失败时填写）",
+    "description": "B站 Cookie（可选，直播接口或UP主稿件接口失败时填写）",
     "type": "string",
     "secret": true,
     "default": ""
   },
   "update_check": {
-    "description": "是否自动检查插件新版本。开启后插件会按下面的间隔查 GitHub Releases，发现新版就投送给审核会话提醒一次（同一版本只提醒一次）；关闭后仍可用 /直播监控 检查更新 手动查",
+    "description": "是否自动检查插件新版本。开启后插件会按下面的间隔查 GitHub Releases，发现新版就发给所有订阅过通知的会话提醒一次（同一版本只提醒一次）；关闭后仍可用 /直播监控 检查更新 手动查",
     "type": "bool",
     "default": true
   },

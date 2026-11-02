@@ -20,9 +20,12 @@ HEADERS = {
 # 封面下载上限。QQ 主动消息对图片体积敏感，过大直接放弃、退化成纯文字。
 MAX_COVER_BYTES = 2 * 1024 * 1024
 
-# 投稿防刷：投稿指令对所有用户开放，靠房间接口校验之外再加两道数量限制。
-MAX_PENDING_PER_SESSION = 3
-MAX_PENDING_TOTAL = 50
+# UP 主稿件历史只用于去重，保留最近这么多条即可覆盖几次漏检，不能让列表无限增长。
+MAX_SEEN_UPLOADS = 60
+# 一次检查最多单独推送几条新稿件。UP 主批量补档时会一次冒出一堆，超过就合并成一条。
+DEFAULT_UPLOAD_MAX_NOTIFY = 3
+DEFAULT_UPLOAD_INTERVAL = 300
+MIN_UPLOAD_INTERVAL = 60
 
 DIVIDER = "────────────────"
 
@@ -74,6 +77,9 @@ PREFIX_MAP = {
     "抖音": "douyin",
     "douyin": "douyin",
 }
+
+BILI_SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)", re.IGNORECASE)
+BILI_LIVE_URL_RE = re.compile(r"live\.bilibili\.com", re.IGNORECASE)
 
 
 class RoomCheckError(Exception):
@@ -153,6 +159,126 @@ async def resolve_bilibili_uid(session: aiohttp.ClientSession, uid: str) -> str:
     if not room_id:
         raise RoomCheckError("该B站用户没有直播间")
     return str(room_id)
+
+
+def _space_headers(cookie: str = "") -> dict:
+    """B站空间（非直播）接口的请求头。Referer 必须是空间页，用直播 Referer 会被风控。"""
+    h = dict(HEADERS)
+    h["Referer"] = "https://space.bilibili.com/"
+    if cookie:
+        h["Cookie"] = cookie
+    return h
+
+
+def _as_int(value, fallback: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return fallback
+
+
+async def fetch_up_info(
+    session: aiohttp.ClientSession, mid: str, cookie: str = ""
+) -> dict:
+    """校验 mid 是否真实存在，并取回 UP 主昵称、头像与稿件总数。"""
+    data = await _get_json(
+        session,
+        f"https://api.bilibili.com/x/web-interface/card?mid={mid}&photo=false",
+        _space_headers(cookie),
+    )
+    if data.get("code") != 0:
+        raise RoomCheckError(
+            f"bilibili 接口返回 code={data.get('code')}，mid 可能不存在"
+        )
+    d = data.get("data") or {}
+    name = str(((d.get("card") or {}).get("name")) or "").strip()
+    if not name:
+        raise RoomCheckError("该 mid 查不到 UP 主信息，请确认空间链接里的数字")
+    return {
+        "name": name,
+        "face": str((d.get("card") or {}).get("face") or ""),
+        "archive_count": _as_int(d.get("archive_count")),
+    }
+
+
+async def fetch_up_uploads(
+    session: aiohttp.ClientSession, mid: str, cookie: str = "", limit: int = 20
+) -> list:
+    """取 UP 主最新稿件，按发布时间从新到旧。
+
+    用 medialist/resource/list 而不是 x/space/wbi/arc/search：后者要 WBI 签名且
+    容易被风控（返回 -352/-403），这个接口免 WBI、免 Cookie 就能拿到列表。
+    """
+    url = (
+        "https://api.bilibili.com/x/v2/medialist/resource/list"
+        f"?type=1&biz_id={mid}&otype=2&ps={limit}&m_source=11&platform=web"
+    )
+    data = await _get_json(session, url, _space_headers(cookie))
+    if data.get("code") != 0:
+        raise RoomCheckError(
+            f"bilibili 稿件接口返回 code={data.get('code')}（{data.get('message')}）"
+        )
+    items = (data.get("data") or {}).get("media_list") or []
+    uploads = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bvid = str(item.get("bv_id") or "").strip()
+        if not bvid:
+            continue
+        # 只认该 UP 主自己的稿件：接口偶尔会混入合集里的他人视频
+        if str((item.get("upper") or {}).get("mid") or "") != mid:
+            continue
+        uploads.append(
+            {
+                "bvid": bvid,
+                "title": str(item.get("title") or ""),
+                "cover": str(item.get("cover") or ""),
+                "pubtime": _as_int(item.get("pubtime")),
+                "url": f"https://www.bilibili.com/video/{bvid}",
+            }
+        )
+    return uploads
+
+
+def format_pubtime(pubtime: int) -> str:
+    if not pubtime:
+        return "时间未知"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(pubtime))
+    except (OverflowError, OSError, ValueError):
+        return "时间未知"
+
+
+def format_upload(up: dict, item: dict) -> str:
+    """渲染单条新稿件通知。"""
+    lines = [
+        "📺 投稿通知",
+        DIVIDER,
+        f"👤 UP：{up['name'] or up['mid']}",
+        f"🎬 标题：{item['title'] or '(无标题)'}",
+        f"🔖 稿件：{item['bvid']}",
+        f"🕒 发布：{format_pubtime(item['pubtime'])}",
+    ]
+    if item["url"]:
+        lines.append(f"🔗 {item['url']}")
+    return "\n".join(lines)
+
+
+def format_uploads_batch(up: dict, fresh: list, shown: list) -> str:
+    """一次出现多条新稿件（UP 主批量补档）时合并成一条，避免刷屏。"""
+    lines = [
+        "📺 投稿通知",
+        DIVIDER,
+        f"👤 UP：{up['name'] or up['mid']}",
+        f"🆕 新增 {len(fresh)} 条稿件，列出最近 {len(shown)} 条：",
+    ]
+    for item in shown:
+        lines.append(f"· {item['title'] or '(无标题)'}（{item['bvid']}）")
+        lines.append(f"  {item['url']}")
+    if len(fresh) > len(shown):
+        lines.append(f"…另有 {len(fresh) - len(shown)} 条未列出")
+    return "\n".join(lines)
 
 
 async def check_douyu(session: aiohttp.ClientSession, room_id: str):
@@ -264,6 +390,26 @@ def room_key(platform: str, room_id: str) -> str:
     return f"{platform}:{room_id}"
 
 
+def parse_up_input(text) -> str | None:
+    """从空间链接 / 平台前缀:数字 / 纯数字里取出 UP 主 mid，取不到返回 None。
+
+    直播间链接必须排除：live.bilibili.com 后面的数字是房间号，和 mid 不是一回事，
+    拿去当 mid 会监控到另一个人。同样要 str() 兜住 AstrBot 传来的 int。
+    """
+    text = str(text).strip()
+    if BILI_LIVE_URL_RE.search(text):
+        return None
+    m = BILI_SPACE_URL_RE.search(text)
+    if m:
+        return m.group(1)
+    parsed = parse_room_input(text)
+    if parsed and parsed[0] == "bilibili":
+        return str(parsed[1])
+    if re.fullmatch(r"\d{2,}", text):
+        return text
+    return None
+
+
 def read_plugin_meta() -> tuple[str, str]:
     """从插件自身目录的 metadata.yaml 读取 (version, repo)。
 
@@ -305,26 +451,6 @@ def version_is_newer(candidate, current) -> bool:
     return left > right
 
 
-def format_submission(sub: dict, header: str, actions: list[str] | None = None) -> str:
-    """渲染投稿记录：投送给审核会话时带处理指令，回投投稿人时不带。"""
-    lines = [
-        header,
-        DIVIDER,
-        f"👤 主播：{sub['anchor'] or sub['room_id']}",
-        f"📡 平台：{PLATFORM_NAMES[sub['platform']]}",
-        f"🚪 房间：{sub['room_id']}",
-        f"📺 标题：{sub['title'] or '(无标题)'}",
-        f"📊 状态：{'直播中' if sub['live'] else '未开播'}",
-        f"🙋 投稿人：{sub['submitter_name']}",
-    ]
-    if sub["url"]:
-        lines.append(f"🔗 {sub['url']}")
-    if actions:
-        lines.append(DIVIDER)
-        lines.extend(actions)
-    return "\n".join(lines)
-
-
 @filter.command_group("直播监控", alias={"开播监控"})
 def monitor_group():
     """直播监控指令组"""
@@ -341,9 +467,7 @@ class LiveMonitorPlugin(Star):
         self.conf = config or {}
         self.data_file: Path = StarTools.get_data_dir() / "rooms.json"
         self.rooms: dict = {}
-        self.submissions: dict = {}
-        self.reviewers: dict = {}
-        self._next_sub_id = 1
+        self.ups: dict = {}
         self._last_check: dict[str, float] = {}
         self.version, repo_url = read_plugin_meta()
         m = GITHUB_REPO_RE.search(repo_url)
@@ -366,26 +490,24 @@ class LiveMonitorPlugin(Star):
             if self.data_file.exists():
                 raw = json.loads(self.data_file.read_text(encoding="utf-8"))
                 if isinstance(raw, dict) and any(
-                    key in raw
-                    for key in ("version", "rooms", "submissions", "reviewers")
+                    key in raw for key in ("version", "rooms", "ups")
                 ):
                     self.rooms = self._sanitize(raw.get("rooms"))
-                    self.submissions = self._sanitize_submissions(
-                        raw.get("submissions")
-                    )
-                    self.reviewers = self._sanitize_sessions(raw.get("reviewers"))
+                    self.ups = self._sanitize_ups(raw.get("ups"))
+                    if raw.get("submissions") or raw.get("reviewers"):
+                        # 0.1.2 的「群友投稿 + 管理员审核」在 0.2.0 移除：
+                        # 旧数据读不读没意义，直接丢掉，下次 _save 就写成 v3 结构
+                        self.logger.info(
+                            "已忽略旧数据里的投稿队列（submissions/reviewers），"
+                            "该功能在 0.2.0 移除，改用 /直播监控 监控UP 监控UP主新稿件"
+                        )
                 else:
                     # 0.1.1 及以前：顶层对象就是房间表，直接按旧格式载入
                     self.rooms = self._sanitize(raw)
-                    self.submissions = {}
-                    self.reviewers = {}
-                ids = [int(sid) for sid in self.submissions]
-                self._next_sub_id = (max(ids) + 1) if ids else 1
         except Exception as e:
             self.logger.warning(f"读取监控数据失败: {e}")
             self.rooms = {}
-            self.submissions = {}
-            self.reviewers = {}
+            self.ups = {}
 
     def _sanitize(self, raw) -> dict:
         """校验 rooms.json。手工编辑过的数据可能缺字段、类型不对，甚至 platform
@@ -422,50 +544,37 @@ class LiveMonitorPlugin(Star):
         return rooms
 
     def _sanitize_sessions(self, raw) -> dict:
-        """校验 {会话UMO: 名称} 结构（订阅者 watchers、审核者 reviewers 同构）。"""
+        """校验 {会话UMO: 名称} 结构（房间与 UP 主的订阅者同构）。"""
         if not isinstance(raw, dict):
             return {}
         return {str(k): str(v) for k, v in raw.items() if str(k)}
 
-    def _sanitize_submissions(self, raw) -> dict:
-        subs = {}
+    def _sanitize_ups(self, raw) -> dict:
+        """校验 ups 段，理由同 _sanitize：手工编辑过的数据不能让轮询炸掉。"""
+        ups = {}
         if not isinstance(raw, dict):
-            return subs
-        for sid, sub in raw.items():
-            if not isinstance(sub, dict) or not str(sid).isdigit():
+            return ups
+        for mid, up in raw.items():
+            mid = str(mid).strip()
+            if not mid.isdigit() or not isinstance(up, dict):
+                self.logger.warning(f"UP 主 {mid} 数据不对，已跳过")
                 continue
-            platform = sub.get("platform")
-            room_id = str(sub.get("room_id") or "").strip()
-            if platform not in CHECKERS or not room_id:
-                continue
-            submitter_umo = str(sub.get("submitter_umo") or "")
-            if not submitter_umo:
-                # 没有投稿人就没人能收到审核结果，这条留着只会挡住同名投稿
-                continue
-            try:
-                created_at = float(sub.get("created_at") or 0)
-            except (TypeError, ValueError):
-                created_at = 0.0
-            subs[str(sid)] = {
-                "platform": platform,
-                "room_id": room_id,
-                "title": str(sub.get("title") or ""),
-                "anchor": str(sub.get("anchor") or ""),
-                "url": str(sub.get("url") or ""),
-                "live": sub.get("live") is True,
-                "submitter_umo": submitter_umo,
-                "submitter_name": str(sub.get("submitter_name") or submitter_umo),
-                "created_at": created_at,
+            seen = [str(b).strip() for b in (up.get("seen") or []) if str(b).strip()]
+            ups[mid] = {
+                "mid": mid,
+                "platform": "bilibili",
+                "name": str(up.get("name") or ""),
+                "face": str(up.get("face") or ""),
+                "archive_count": _as_int(up.get("archive_count")),
+                "watchers": self._sanitize_sessions(up.get("watchers")),
+                # 列表按从新到旧保存，超出上限的旧稿件直接丢弃
+                "seen": seen[:MAX_SEEN_UPLOADS],
+                "fails": 0,
             }
-        return subs
+        return ups
 
     def _save(self):
-        payload = {
-            "version": 2,
-            "rooms": self.rooms,
-            "submissions": self.submissions,
-            "reviewers": self.reviewers,
-        }
+        payload = {"version": 3, "rooms": self.rooms, "ups": self.ups}
         try:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
             self.data_file.write_text(
@@ -570,36 +679,52 @@ class LiveMonitorPlugin(Star):
 
     @monitor_group.command("列表")
     async def cmd_list(self, event):
-        """查看当前监控的直播间列表"""
-        if not self.rooms:
+        """查看当前监控的直播间与UP主列表"""
+        if not self.rooms and not self.ups:
             yield event.plain_result(
-                "当前没有监控任何直播间，使用 /直播监控 添加 <链接> 添加。"
+                "当前没有监控任何直播间或UP主。\n"
+                "直播间: /直播监控 添加 <链接>\n"
+                "UP主新稿件: /直播监控 监控UP <mid 或 空间链接>"
             )
             return
-        lines = ["当前监控列表:"]
-        for room in self.rooms.values():
-            if room["live"] is True:
-                status = "[直播中]"
-            elif room["live"] is False:
-                status = "[未开播]"
-            else:
-                status = "[待检测]"
-            title = f" | {room['title']}" if room["title"] else ""
-            sub = "√" if event.unified_msg_origin in room["watchers"] else "-"
-            lines.append(
-                f"{sub} [{PLATFORM_NAMES[room['platform']]}] "
-                f"{room['platform']}:{room['room_id']} {status}"
-                f"{title}（订阅数 {len(room['watchers'])}）"
-            )
-            if self._is_admin(event):
-                for umo in room["watchers"]:
-                    lines.append(f"    ↳ {umo}")
-        lines.append("（√ 表示本会话已订阅通知；删除/订阅 时使用 平台:房间号）")
-        if self.submissions and self._is_admin(event):
-            lines.append(
-                f"另有 {len(self.submissions)} 条待审核投稿，"
-                "用 /直播监控 投稿列表 查看。"
-            )
+        is_admin = self._is_admin(event)
+        lines = []
+        if self.rooms:
+            lines.append("当前监控的直播间:")
+            for room in self.rooms.values():
+                if room["live"] is True:
+                    status = "[直播中]"
+                elif room["live"] is False:
+                    status = "[未开播]"
+                else:
+                    status = "[待检测]"
+                title = f" | {room['title']}" if room["title"] else ""
+                sub = "√" if event.unified_msg_origin in room["watchers"] else "-"
+                lines.append(
+                    f"{sub} [{PLATFORM_NAMES[room['platform']]}] "
+                    f"{room['platform']}:{room['room_id']} {status}"
+                    f"{title}（订阅数 {len(room['watchers'])}）"
+                )
+                if is_admin:
+                    for umo in room["watchers"]:
+                        lines.append(f"    ↳ {umo}")
+        if self.ups:
+            lines.append("当前监控的UP主（B站新稿件）:")
+            for up in self.ups.values():
+                sub = "√" if event.unified_msg_origin in up["watchers"] else "-"
+                known = (
+                    f"，已记录 {len(up['seen'])} 条稿件"
+                    if up["seen"]
+                    else "，待首次检测"
+                )
+                lines.append(
+                    f"{sub} [B站UP] up:{up['mid']} {up['name'] or '(未解析)'}"
+                    f"（{up['archive_count']} 稿件，订阅数 {len(up['watchers'])}{known}）"
+                )
+                if is_admin:
+                    for umo in up["watchers"]:
+                        lines.append(f"    ↳ {umo}")
+        lines.append("（√ 表示本会话已订阅通知；房间用 平台:房间号，UP主用 mid）")
         yield event.plain_result("\n".join(lines))
 
     @monitor_group.command("订阅")
@@ -638,245 +763,115 @@ class LiveMonitorPlugin(Star):
         self._save()
         yield event.plain_result("已取消本会话对该房间的通知。")
 
-    @monitor_group.command("投稿")
-    async def cmd_submit(self, event, room_input: str | None = None):
-        """投稿直播间，投送给管理员审核。用法: /直播监控 投稿 <直播间链接>"""
-        if not room_input:
+    @monitor_group.command("监控UP")
+    async def cmd_add_up(self, event, up_input: str | None = None):
+        """添加B站UP主并监控其新稿件。用法: /直播监控 监控UP <mid 或 空间链接>"""
+        if deny := self._admin_only(event):
+            yield deny
+            return
+        if not up_input:
             yield event.plain_result(
-                "用法: /直播监控 投稿 <直播间链接>\n"
-                "示例: /直播监控 投稿 https://live.bilibili.com/123456\n"
-                "投稿不需要管理员权限：插件会先校验房间是否存在，再投送给管理员审核，"
-                "通过后本会话收到开播/关播通知。"
+                "用法: /直播监控 监控UP <UP主mid 或 空间链接>\n"
+                "示例:\n"
+                "/直播监控 监控UP https://space.bilibili.com/946974\n"
+                "/直播监控 监控UP 946974\n"
+                "mid 就是UP主空间地址 space.bilibili.com/ 后面的数字，只支持B站UP主。"
             )
             return
-        parsed = parse_room_input(room_input)
-        if not parsed:
+        mid = parse_up_input(up_input)
+        if not mid:
             yield event.plain_result(
-                "无法识别的直播间链接或房间号。\n"
-                "请直接发送直播间链接，或使用 平台:房间号 格式，如 斗鱼:123456"
+                "无法识别的UP主ID。请发送空间链接（space.bilibili.com/数字），"
+                "或直接给 mid 数字。\n"
+                "注意: live.bilibili.com 后面的数字是直播间房间号，不能当UP主ID用。"
             )
             return
-        platform, room_id, is_bili_uid = parsed
+        cookie = str(self.conf.get("bilibili_cookie") or "")
         try:
             async with aiohttp.ClientSession() as session:
-                if is_bili_uid:
-                    room_id = await resolve_bilibili_uid(session, room_id)
-                info = await self._fetch_room_info(session, platform, room_id)
+                info = await fetch_up_info(session, mid, cookie)
         except Exception as e:
-            yield event.plain_result(f"直播间校验失败: {e}")
+            yield event.plain_result(f"UP主校验失败: {e}")
             return
-        key = room_key(platform, room_id)
-        pname = PLATFORM_NAMES[platform]
-        if key in self.rooms:
-            yield event.plain_result(
-                f"{pname} 房间 {room_id} 已在监控列表中，无需投稿。\n"
-                f"想让本会话接收通知，请管理员执行 /直播监控 订阅 {key}。"
-            )
-            return
-        for sid, sub in self.submissions.items():
-            if room_key(sub["platform"], sub["room_id"]) == key:
-                yield event.plain_result(
-                    f"该房间已有待审核投稿（#{sid}），请等管理员处理后再投。"
-                )
-                return
-        umo = event.unified_msg_origin
-        mine = sorted(
-            (sid for sid, s in self.submissions.items() if s["submitter_umo"] == umo),
-            key=int,
-        )
-        if len(mine) >= MAX_PENDING_PER_SESSION:
-            yield event.plain_result(
-                f"你的待审核投稿已达上限 {MAX_PENDING_PER_SESSION} 条"
-                f"（#{', #'.join(mine)}），请等管理员处理后再投。"
-            )
-            return
-        if len(self.submissions) >= MAX_PENDING_TOTAL:
-            yield event.plain_result("待审核投稿已经排满了，请联系管理员先处理一批。")
-            return
-
-        sid = str(self._next_sub_id)
-        self._next_sub_id += 1
-        sub = {
-            "platform": platform,
-            "room_id": room_id,
-            "title": info.get("title", ""),
-            "anchor": info.get("anchor", ""),
-            "url": info.get("url", ""),
-            "live": info.get("live") is True,
-            "submitter_umo": umo,
-            "submitter_name": event.get_sender_name() or event.get_sender_id(),
-            "created_at": time.time(),
-        }
-        self.submissions[sid] = sub
-        self._save()
-        sent = await self._deliver(
-            format_submission(
-                sub,
-                f"📮 新投稿 #{sid} 待审核",
-                [
-                    f"/直播监控 投稿通过 {sid}",
-                    f"/直播监控 投稿拒绝 {sid} [原因]",
-                ],
-            )
-        )
-        if sent:
-            tip = (
-                f"已投稿（#{sid}），并投送给 {sent} 个审核会话。"
-                "管理员通过后本会话会收到开播/关播通知。"
-            )
-        elif self.reviewers:
-            tip = (
-                f"已投稿（#{sid}），但推送给 {len(self.reviewers)} 个审核会话均失败"
-                "（详见插件日志），管理员请用 /直播监控 投稿列表 查看待审。"
-            )
-        else:
-            tip = (
-                f"已投稿（#{sid}）。\n"
-                "目前还没有审核会话接收投稿，管理员请用 "
-                "/直播监控 投稿列表 查看待审，或在想接收投稿的群里执行 "
-                "/直播监控 审核订阅。"
-            )
-        yield event.plain_result(tip)
-
-    @monitor_group.command("投稿列表")
-    async def cmd_submissions(self, event):
-        """查看待审核投稿。用法: /直播监控 投稿列表"""
-        if deny := self._admin_only(event):
-            yield deny
-            return
-        lines = [f"待审核投稿 {len(self.submissions)} 条:"]
-        for sid in sorted(self.submissions, key=int):
-            sub = self.submissions[sid]
-            title = f" | {sub['title']}" if sub["title"] else ""
-            lines.append(
-                f"#{sid} [{PLATFORM_NAMES[sub['platform']]}] "
-                f"{sub['platform']}:{sub['room_id']} "
-                f"{sub['anchor'] or '(未知主播)'}{title} "
-                f"来自 {sub['submitter_name']}，{self._ago(sub['created_at'])}"
-            )
-        if len(self.submissions) == 1:
-            sid = next(iter(self.submissions))
-            lines.append(f"处理: /直播监控 投稿通过 {sid} 或 投稿拒绝 {sid} [原因]")
-        else:
-            lines.append("处理: /直播监控 投稿通过 <编号> 或 投稿拒绝 <编号> [原因]")
-        if self.reviewers:
-            lines.append(
-                "投送目标: "
-                + "、".join(f"{umo}({name})" for umo, name in self.reviewers.items())
-            )
-        else:
-            lines.append(
-                "⚠ 尚未配置投送目标，新投稿不会主动推送；"
-                "在需要接收的会话中执行 /直播监控 审核订阅。"
-            )
-        yield event.plain_result("\n".join(lines))
-
-    @monitor_group.command("投稿通过")
-    async def cmd_approve(self, event, sub_id: str | None = None):
-        """通过投稿并加入监控。用法: /直播监控 投稿通过 <编号>"""
-        if deny := self._admin_only(event):
-            yield deny
-            return
-        sid, sub = self._find_submission(sub_id)
-        if not sub:
-            yield event.plain_result(
-                "未找到该待审核投稿，可先用 /直播监控 投稿列表 查看编号。"
-            )
-            return
-        key = room_key(sub["platform"], sub["room_id"])
-        is_new = key not in self.rooms
-        room = self._register_room(sub["platform"], sub["room_id"])
-        room["watchers"][sub["submitter_umo"]] = sub["submitter_name"]
-        room["watchers"][event.unified_msg_origin] = (
+        is_new = mid not in self.ups
+        up = self._register_up(mid)
+        up["name"] = info["name"]
+        up["face"] = info["face"]
+        up["archive_count"] = info["archive_count"]
+        up["watchers"][event.unified_msg_origin] = (
             event.get_sender_name() or event.get_sender_id()
         )
-        self.submissions.pop(sid)
         self._save()
-        pname = PLATFORM_NAMES[sub["platform"]]
-        if sub["submitter_umo"] != event.unified_msg_origin:
-            await self._send(
-                sub["submitter_umo"],
-                [
-                    Plain(
-                        f"✅ 投稿 #{sid} 已通过审核\n"
-                        f"{pname} 房间 {sub['room_id']} 已加入监控，"
-                        "本会话将收到开播/关播通知。"
-                    )
-                ],
-            )
-        tip = f"已通过投稿 #{sid}: {pname} 房间 {sub['room_id']}，订阅数 {len(room['watchers'])}。"
         if not is_new:
-            tip += (
-                "\n该房间此前已在监控列表中（可能有人直接添加过），本次只追加了订阅。"
-            )
-        yield event.plain_result(tip)
-
-    @monitor_group.command("投稿拒绝")
-    async def cmd_reject(
-        self, event, sub_id: str | None = None, note: str | None = None
-    ):
-        """拒绝投稿。用法: /直播监控 投稿拒绝 <编号> [原因]"""
-        if deny := self._admin_only(event):
-            yield deny
-            return
-        sid, sub = self._find_submission(sub_id)
-        if not sub:
             yield event.plain_result(
-                "未找到该待审核投稿，可先用 /直播监控 投稿列表 查看编号。"
+                f"该UP主已在监控列表中（{info['name']}，mid {mid}），"
+                f"当前订阅数 {len(up['watchers'])}。"
             )
             return
-        reason = str(note).strip() if note else ""
-        self.submissions.pop(sid)
-        self._save()
-        text = (
-            f"❌ 投稿 #{sid} 未通过审核\n"
-            f"📝 原因：{reason or '管理员未说明'}\n"
-            "可以修改后重新投稿（/直播监控 投稿 <直播间链接>）。"
+        yield event.plain_result(
+            f"已添加UP主监控: {info['name']}（mid {mid}，"
+            f"共 {info['archive_count']} 条稿件），本会话将收到新稿件通知。\n"
+            f"稿件检查间隔 {self._upload_interval()} 秒，"
+            "首轮只记录已有稿件作为基线，不会补推送历史视频。"
         )
-        if sub["submitter_umo"] != event.unified_msg_origin:
-            await self._send(sub["submitter_umo"], [Plain(text)])
-            tip = f"已拒绝投稿 #{sid}，结果已回投投稿会话。"
-        else:
-            tip = f"已拒绝投稿 #{sid}。"
-        yield event.plain_result(tip)
 
-    @monitor_group.command("审核订阅")
-    async def cmd_review_on(self, event):
-        """把本会话加入投稿投送列表。用法: /直播监控 审核订阅"""
+    @monitor_group.command("移除UP")
+    async def cmd_del_up(self, event, up_input: str | None = None):
+        """移除UP主稿件监控。用法: /直播监控 移除UP <mid 或 UP主昵称>"""
         if deny := self._admin_only(event):
             yield deny
             return
-        self.reviewers[event.unified_msg_origin] = (
+        if not up_input:
+            yield event.plain_result(
+                "用法: /直播监控 移除UP <mid 或 UP主昵称>，可先用 /直播监控 列表 查看。"
+            )
+            return
+        mid = self._resolve_up(up_input)
+        if not mid:
+            yield event.plain_result(
+                f"未监控过 {up_input}，可先用 /直播监控 列表 查看已添加的UP主。"
+            )
+            return
+        up = self.ups.pop(mid)
+        self._last_check.pop(f"up:{mid}", None)
+        self._save()
+        yield event.plain_result(f"已移除UP主监控: {up['name'] or mid}（mid {mid}）")
+
+    @monitor_group.command("订阅UP")
+    async def cmd_sub_up(self, event, up_input: str | None = None):
+        """订阅某个已监控UP主的新稿件通知。用法: /直播监控 订阅UP <mid 或 UP主昵称>"""
+        if deny := self._admin_only(event):
+            yield deny
+            return
+        mid = self._resolve_up(up_input)
+        if not mid:
+            yield event.plain_result(
+                "未找到该UP主，可先用 /直播监控 列表 查看，"
+                "或用 /直播监控 监控UP <mid> 添加。"
+            )
+            return
+        self.ups[mid]["watchers"][event.unified_msg_origin] = (
             event.get_sender_name() or event.get_sender_id()
         )
         self._save()
-        yield event.plain_result(
-            f"本会话已加入投稿投送列表（当前 {len(self.reviewers)} 个会话），"
-            "新投稿会自动推送到这里。"
-        )
+        yield event.plain_result("已订阅该UP主的新稿件通知。")
 
-    @monitor_group.command("审核取消")
-    async def cmd_review_off(self, event):
-        """把本会话移出投稿投送列表。用法: /直播监控 审核取消"""
+    @monitor_group.command("退订UP")
+    async def cmd_unsub_up(self, event, up_input: str | None = None):
+        """取消本会话的UP主稿件通知（不移除监控）。用法: /直播监控 退订UP <mid>"""
         if deny := self._admin_only(event):
             yield deny
             return
-        if event.unified_msg_origin not in self.reviewers:
-            yield event.plain_result("本会话不在投稿投送列表中。")
+        mid = self._resolve_up(up_input)
+        if not mid:
+            yield event.plain_result("未找到该UP主，可先用 /直播监控 列表 查看。")
             return
-        self.reviewers.pop(event.unified_msg_origin)
+        if event.unified_msg_origin not in self.ups[mid]["watchers"]:
+            yield event.plain_result("本会话未订阅该UP主的稿件通知。")
+            return
+        self.ups[mid]["watchers"].pop(event.unified_msg_origin)
         self._save()
-        yield event.plain_result(
-            f"本会话已移出投稿投送列表（剩余 {len(self.reviewers)} 个会话）。"
-        )
-
-    def _find_submission(self, sub_id):
-        """按编号取待审核投稿，编号可带 # 前缀；找不到返回 (None, None)。"""
-        if sub_id is None:
-            return None, None
-        sid = str(sub_id).lstrip("#").strip()
-        sub = self.submissions.get(sid)
-        return (sid, sub) if sub else (None, None)
+        yield event.plain_result("已取消本会话对该UP主的稿件通知。")
 
     def _register_room(self, platform: str, room_id: str) -> dict:
         """把房间加入监控表（不落盘），已存在则返回原记录。"""
@@ -897,24 +892,54 @@ class LiveMonitorPlugin(Star):
             self.rooms[key] = room
         return room
 
-    async def _fetch_room_info(
-        self, session: aiohttp.ClientSession, platform: str, room_id: str
-    ) -> dict:
-        """投稿时拉一次房间信息：既验证房间真实存在，也给审核消息补上主播与标题。"""
-        cookie = str(self.conf.get("bilibili_cookie") or "")
-        if platform == "bilibili":
-            result = await CHECKERS[platform](session, room_id, cookie)
-            # B站接口只给 uid，昵称另外查一次
-            if not result.get("anchor") and result.get("anchor_uid"):
-                result["anchor"] = await resolve_bilibili_anchor(
-                    session, result["anchor_uid"], cookie
-                )
-            return result
-        return await CHECKERS[platform](session, room_id)
+    def _register_up(self, mid: str) -> dict:
+        """把UP主加入监控表（不落盘），已存在则返回原记录。"""
+        up = self.ups.get(mid)
+        if up is None:
+            up = {
+                "mid": mid,
+                # 与房间记录同构，_notify 复用同一套白名单与封面下载逻辑
+                "platform": "bilibili",
+                "name": "",
+                "face": "",
+                "archive_count": 0,
+                "watchers": {},
+                "seen": [],
+                "fails": 0,
+            }
+            self.ups[mid] = up
+        return up
+
+    def _resolve_up(self, up_input) -> str | None:
+        """把 mid / 空间链接 / UP主昵称 解析成监控中的 mid，找不到返回 None。"""
+        if up_input is None:
+            return None
+        text = str(up_input).strip()
+        if not text:
+            return None
+        parsed = parse_up_input(text)
+        if parsed and parsed in self.ups:
+            return parsed
+        if text in self.ups:
+            return text
+        for mid, up in self.ups.items():
+            if text == up["name"]:
+                return mid
+        return None
+
+    def _notify_targets(self) -> list:
+        """所有订阅过通知的会话（房间 + UP主，去重），并按 notify_whitelist 过滤。"""
+        watchers = set()
+        for room in self.rooms.values():
+            watchers.update(room["watchers"])
+        for up in self.ups.values():
+            watchers.update(up["watchers"])
+        whitelist = self._notify_whitelist()
+        return sorted(umo for umo in watchers if not whitelist or umo in whitelist)
 
     async def _deliver(self, text: str) -> int:
-        """把投稿消息投送给所有审核会话，返回成功送达的会话数。"""
-        targets = list(self.reviewers.keys())
+        """把系统消息（如新版本提醒）群发给所有订阅会话，返回成功送达的会话数。"""
+        targets = self._notify_targets()
         sent = 0
         for idx, umo in enumerate(targets):
             if await self._send(umo, [Plain(text)]):
@@ -922,19 +947,6 @@ class LiveMonitorPlugin(Star):
             if idx + 1 < len(targets):
                 await asyncio.sleep(1)
         return sent
-
-    @staticmethod
-    def _ago(created_at: float) -> str:
-        if not created_at:
-            return "时间未知"
-        minutes = int((time.time() - created_at) // 60)
-        if minutes < 1:
-            return "刚刚"
-        if minutes < 60:
-            return f"{minutes} 分钟前"
-        if minutes < 24 * 60:
-            return f"{minutes // 60} 小时前"
-        return f"{minutes // (24 * 60)} 天前"
 
     # ---------- 插件自动更新检查 ----------
 
@@ -1026,12 +1038,13 @@ class LiveMonitorPlugin(Star):
         sent = await self._deliver(self._update_text(release, "🆕 直播监控插件可更新"))
         if sent:
             self.logger.info(
-                f"发现新版本 {release['version']}（当前 v{self.version}），已提醒 {sent} 个审核会话"
+                f"发现新版本 {release['version']}（当前 v{self.version}），"
+                f"已提醒 {sent} 个订阅会话"
             )
         else:
             self.logger.info(
                 f"发现新版本 {release['version']}（当前 v{self.version}），"
-                "但没有审核会话可提醒，管理员请用 /直播监控 检查更新 查看"
+                "但没有订阅会话可提醒，管理员请用 /直播监控 检查更新 查看"
             )
 
     @monitor_group.command("检查更新")
@@ -1070,21 +1083,26 @@ class LiveMonitorPlugin(Star):
     async def cmd_help(self, event):
         """查看直播监控帮助"""
         yield event.plain_result(
-            "=== 直播开播监控 ===\n"
+            "=== 直播开播 / UP主稿件监控 ===\n"
             "指令前缀: /直播监控 或 /开播监控\n"
+            "—— 直播间 ——\n"
             "添加 <直播间链接或 平台:房间号>  添加监控并订阅通知（管理员）\n"
             "删除 <平台:房间号>  删除监控\n"
-            "列表  查看监控列表及状态\n"
             "订阅 <平台:房间号>  订阅本会话通知\n"
             "取消 <平台:房间号>  取消本会话通知\n"
-            "投稿 <直播间链接>  投稿房间，投送给管理员审核（所有人可用）\n"
-            "投稿列表  查看待审核投稿（管理员）\n"
-            "投稿通过 <编号> / 投稿拒绝 <编号> [原因]  处理投稿（管理员，原因不能含空格）\n"
-            "审核订阅 / 审核取消  让本会话接收（或停止接收）投稿推送（管理员）\n"
+            "—— B站UP主新稿件 ——\n"
+            "监控UP <mid 或 space.bilibili.com/数字>  添加UP主并订阅新稿件通知（管理员）\n"
+            "移除UP <mid 或 UP主昵称>  移除该UP主的稿件监控（管理员）\n"
+            "订阅UP <mid 或 UP主昵称>  订阅本会话稿件通知\n"
+            "退订UP <mid 或 UP主昵称>  取消本会话稿件通知\n"
+            "—— 通用 ——\n"
+            "列表  查看监控的直播间与UP主\n"
             "检查更新  立即查一次 GitHub 上有没有新版插件（管理员）\n"
-            "支持平台: B站直播(bili)、斗鱼(douyu)、虎牙(huya/hy)、抖音(douyin)\n"
-            "开播/关播会自动推送主播名、房间号、标题、链接与封面。\n"
-            "除 投稿/列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
+            "支持平台: B站直播(bili)、斗鱼(douyu)、虎牙(huya/hy)、抖音(douyin)；"
+            "UP主稿件仅支持B站。\n"
+            "开播/关播会推送主播名、房间号、标题、链接与封面；"
+            "UP主发新稿件会推送标题、BV号、发布时间与封面。\n"
+            "除 列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
             "通知白名单：插件配置 notify_whitelist，填写允许接收通知的会话UMO，留空不限制。"
         )
 
@@ -1150,11 +1168,77 @@ class LiveMonitorPlugin(Star):
                     finally:
                         self._last_check[key] = time.monotonic()
                     await asyncio.sleep(1)
+                up_interval = self._upload_interval()
+                due_ups = []
+                for mid, up in self.ups.items():
+                    if not up["watchers"]:
+                        continue
+                    if now - self._last_check.get(f"up:{mid}", 0) >= up_interval:
+                        due_ups.append(mid)
+                for mid in due_ups:
+                    up = self.ups.get(mid)
+                    if not up:
+                        continue
+                    try:
+                        await self._check_up(session, up)
+                        up["fails"] = 0
+                    except Exception as e:
+                        up["fails"] = up.get("fails", 0) + 1
+                        if up["fails"] in (1, 10) or up["fails"] % 30 == 0:
+                            self.logger.warning(
+                                f"检查UP主 {mid} 失败(第{up['fails']}次): {e}"
+                            )
+                    finally:
+                        self._last_check[f"up:{mid}"] = time.monotonic()
+                    await asyncio.sleep(1)
                 await asyncio.sleep(5)
         except asyncio.CancelledError:
             pass
         finally:
             await session.close()
+
+    def _upload_interval(self) -> int:
+        return max(
+            MIN_UPLOAD_INTERVAL,
+            self._conf_int("upload_check_interval", DEFAULT_UPLOAD_INTERVAL),
+        )
+
+    async def _check_up(self, session: aiohttp.ClientSession, up: dict):
+        """检查UP主有没有新稿件。seen 为空视为基线：只记录、不推送。"""
+        cookie = str(self.conf.get("bilibili_cookie") or "")
+        uploads = await fetch_up_uploads(session, up["mid"], cookie)
+        latest = [item["bvid"] for item in uploads]
+        if not up["seen"]:
+            up["seen"] = latest[:MAX_SEEN_UPLOADS]
+            self._save()
+            return
+        known = set(up["seen"])
+        # 接口按从新到旧返回，倒过来通知，顺序与UP主投稿时间一致
+        fresh = [item for item in uploads if item["bvid"] not in known][::-1]
+        merged = latest + [bvid for bvid in up["seen"] if bvid not in set(latest)]
+        up["seen"] = merged[:MAX_SEEN_UPLOADS]
+        if not fresh:
+            self._save()
+            return
+        if self.conf.get("notify_upload", True):
+            cap = max(
+                1,
+                self._conf_int("upload_max_notify", DEFAULT_UPLOAD_MAX_NOTIFY),
+            )
+            shown = fresh[-cap:]
+            if len(shown) == 1:
+                text = format_upload(up, shown[0])
+                if len(fresh) > len(shown):
+                    text += f"\n另有 {len(fresh) - len(shown)} 条新稿件未列出"
+                await self._notify(session, up, text, shown[0]["cover"])
+            else:
+                await self._notify(
+                    session, up, format_uploads_batch(up, fresh, shown), ""
+                )
+            self.logger.info(
+                f"UP主 {up['mid']}（{up['name']}）新增 {len(fresh)} 条稿件，已推送"
+            )
+        self._save()
 
     async def _check_room(self, session: aiohttp.ClientSession, room: dict):
         platform = room["platform"]

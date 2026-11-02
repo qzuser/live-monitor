@@ -10,8 +10,8 @@ import asyncio
 import tempfile
 import time
 
-import aiohttp
-from stubs import (
+# 必须先导入 stubs（它会替换 sys.modules 里的 aiohttp），再导入 aiohttp
+from stubs import (  # noqa: E402
     ADMIN_UMO,
     USER_UMO,
     admin,
@@ -20,13 +20,14 @@ from stubs import (
     run,
     user,
 )
+import aiohttp  # noqa: E402
 
 
 def release(tag, **overrides):
     item = {
         "tag_name": tag,
         "published_at": "2026-10-10T08:00:00Z",
-        "body": "- 新增投稿审核\n- 修复纯数字房间号崩溃",
+        "body": "- 新增UP主稿件监控\n- 修复纯数字房间号崩溃",
         "html_url": f"https://github.com/qzuser/live-monitor/releases/tag/{tag}",
         "draft": False,
         "prerelease": False,
@@ -64,6 +65,21 @@ async def stop_poll(task):
             await task
         except asyncio.CancelledError:
             pass
+
+
+def add_watched_room(plugin, umo=ADMIN_UMO):
+    """更新提醒现在发给所有订阅会话，先造一个把该会话订阅上的房间。"""
+    plugin.rooms["bilibili:6"] = {
+        "platform": "bilibili",
+        "room_id": "6",
+        "title": "",
+        "anchor": "",
+        "cover": "",
+        "url": "",
+        "live": False,
+        "watchers": {umo: "订阅者"},
+        "fails": 0,
+    }
 
 
 async def test_version_compare(tmp):
@@ -123,7 +139,7 @@ async def test_pick_release_skips_non_stable(tmp):
 async def test_background_hint_once_per_version(tmp):
     plugin = build(tmp)
     plugin.version = "0.1.2"
-    await run(plugin.cmd_review_on, admin())
+    add_watched_room(plugin)
     patch_releases(plugin, [release("v0.2.0")])
     async with aiohttp.ClientSession() as session:
         await plugin._check_plugin_update(session, time.monotonic())
@@ -134,7 +150,7 @@ async def test_background_hint_once_per_version(tmp):
     assert "当前版本：v0.1.2" in text and "最新版本：v0.2.0" in text
     assert "发布于：2026-10-10" in text
     assert f"{plugin._repo_page}/releases" in text
-    assert "新增投稿审核" in text and "AstrBot WebUI" in text
+    assert "新增UP主稿件监控" in text and "AstrBot WebUI" in text
     assert plugin._update_hint_version == "v0.2.0"
     assert plugin.fetch_calls == 1
 
@@ -172,15 +188,15 @@ async def test_check_schedule_and_missing_meta(tmp):
     assert plugin.fetch_calls == 2  # 缺元信息时不再发请求
 
 
-async def test_no_reviewers_and_failures_are_logged(tmp):
-    """没审核会话/请求失败都不该抛异常，但要在日志里留痕。"""
+async def test_no_subscribers_and_failures_are_logged(tmp):
+    """没有订阅会话/请求失败都不该抛异常，但要在日志里留痕。"""
     plugin = build(tmp)
     plugin.version = "0.1.2"
     patch_releases(plugin, [release("v0.3.0")])
     async with aiohttp.ClientSession() as session:
         await plugin._check_plugin_update(session, time.monotonic())
     assert plugin.context.sent == []
-    assert "没有审核会话可提醒" in plugin.logger.messages[-1][1]
+    assert "没有订阅会话可提醒" in plugin.logger.messages[-1][1]
     assert "/直播监控 检查更新" in plugin.logger.messages[-1][1]
 
     patch_releases(plugin, main.RoomCheckError("GitHub API HTTP 403"))
@@ -276,7 +292,7 @@ async def main_test():
         ("跳过草稿与预发布", test_pick_release_skips_non_stable),
         ("后台提醒每版一次", test_background_hint_once_per_version),
         ("检查间隔与缺元信息", test_check_schedule_and_missing_meta),
-        ("无审核会话/失败留痕", test_no_reviewers_and_failures_are_logged),
+        ("无订阅会话/失败留痕", test_no_subscribers_and_failures_are_logged),
         ("检查更新指令", test_check_update_command),
         ("update_check 开关", test_update_check_config_gate),
         ("检查失败不影响轮询", test_failed_check_does_not_stop_polling),
