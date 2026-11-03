@@ -5,10 +5,10 @@ desc: >-
   支持 B站直播、斗鱼、虎牙、抖音直播的开播/关播监控，
   以及B站UP主新稿件监控（按 mid 或空间链接添加UP主，发布新视频时推送标题、BV号与封面）。
   可在聊天中通过 /直播监控 添加、删除、订阅监控对象，
-  状态变化时自动向订阅的会话推送通知，
+  状态变化时自动向订阅的会话推送通知（开播带距离上次直播的时间、关播带本次直播时长），
   并会定期检查 GitHub 上的插件新版本、有新版本时提醒已订阅的会话。
 author: pulin
-version: 0.2.0
+version: 0.2.1
 repo: "https://github.com/qzuser/live-monitor"
 support_platforms:
   - aiocqhttp

@@ -89,14 +89,14 @@ async def stop_poll(task):
 
 
 async def test_legacy_flat_data_upgraded(tmp):
-    """0.1.1 的扁平 rooms.json 要能读出来，并写成 v3 结构。"""
+    """0.1.1 的扁平 rooms.json 要能读出来，并写成 v4 结构。"""
     write_data(tmp, {"bilibili:6": room_record(title="老标题")})
     plugin = build(tmp)
     assert plugin.rooms["bilibili:6"]["title"] == "老标题"
     assert plugin.ups == {}
     await run(plugin.cmd_del, admin(), "bilibili:6")
     payload = read_data(tmp)
-    assert payload["version"] == 3
+    assert payload["version"] == 4
     assert set(payload) == {"version", "rooms", "ups"}
 
 
@@ -776,6 +776,132 @@ async def test_last_live_at_survives_reload_and_dirty_data(tmp):
     assert restored.rooms["bilibili:9"]["last_live_at"] == 0
 
 
+# ---------- 关播时长统计 ----------
+
+
+async def test_format_duration_units(tmp):
+    assert main.format_duration(3 * DAY + 7 * 3600) == "3天7小时"
+    assert main.format_duration(2 * DAY) == "2天"
+    assert main.format_duration(2 * 3600 + 15 * 60) == "2小时15分钟"
+    assert main.format_duration(2 * 3600) == "2小时"
+    assert main.format_duration(45 * 60) == "45分钟"
+    assert main.format_duration(59) == "不到1分钟"
+    for bad in (0, -10, "abc", None, ""):
+        assert main.format_duration(bad) == "", bad
+
+
+async def test_end_notify_shows_session_duration(tmp):
+    """关播通知带上本次时长：最后一次看到在播 - 本轮开播时刻。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    room = room_record(
+        live=True,
+        last_live_at=now - 60,
+        live_since=now - 60 - (3 * DAY + 7 * 3600),
+    )
+    plugin.rooms["bilibili:6"] = room
+    swap = live_switch(False)
+    try:
+        async with aiohttp.ClientSession() as session:
+            await plugin._check_room(session, room)
+
+        text = plugin.context.texts(USER_UMO)[-1][1]
+        assert "⚫ 关播通知" in text, text
+        assert "⏱ 本次时长：约3天7小时" in text, text
+        assert text.index("🚪 房间") < text.index("⏱ 本次时长")
+        assert text.index("⏱ 本次时长") < text.index("────────────────\n直播已结束")
+        assert room["live_since"] == 0, "关播后必须清零，否则下一场算出跨场时长"
+        assert read_data(tmp)["rooms"]["bilibili:6"]["live_since"] == 0
+
+        # 小时+分钟都出得来
+        plugin.context.clear()
+        room["live"] = True
+        room["last_live_at"] = now - 60
+        room["live_since"] = now - 60 - (2 * 3600 + 15 * 60)
+        await plugin._check_room(session, room)
+        assert "⏱ 本次时长：约2小时15分钟" in plugin.context.texts(USER_UMO)[-1][1]
+    finally:
+        main.CHECKERS["bilibili"] = swap
+
+
+async def test_end_notify_omits_duration_without_start(tmp):
+    """没抓到开播时刻（升级前就在播、或数据里没有 live_since）就不显示时长这一行。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    room = room_record(live=True, last_live_at=now - 3600)
+    assert "live_since" not in room
+    plugin.rooms["bilibili:6"] = room
+    swap = live_switch(False)
+    try:
+        async with aiohttp.ClientSession() as session:
+            await plugin._check_room(session, room)
+    finally:
+        main.CHECKERS["bilibili"] = swap
+    text = plugin.context.texts(USER_UMO)[-1][1]
+    assert "⚫ 关播通知" in text and "⏱" not in text, text
+    assert "🚪 房间：6" in text and "直播已结束" in text, text
+
+
+async def test_live_since_lifecycle(tmp):
+    """开播记起点、在播期间不刷新、关播清零；首次检测发现已在播时不补记起点。"""
+    plugin = build(tmp)
+    room = room_record(live=None)
+    plugin.rooms["bilibili:6"] = room
+    swap = live_switch(True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            await plugin._check_room(session, room)
+            assert room["live_since"] == 0, "把「我发现它在播」当开播时刻会报出假时长"
+
+            room["live"] = False
+            await plugin._check_room(session, room)
+            start = room["live_since"]
+            assert start > 0, plugin.context.texts(USER_UMO)
+
+            await plugin._check_room(session, room)
+            assert room["live_since"] == start, "在播期间刷新起点会让时长恒等于轮询间隔"
+
+            live_switch(False)
+            room["last_live_at"] = start - 1  # 时间倒挂（时钟回拨/手工改坏）
+            await plugin._check_room(session, room)
+            assert room["live_since"] == 0
+            text = plugin.context.texts(USER_UMO)[-1][1]
+            assert "⚫ 关播通知" in text and "⏱" not in text, text
+    finally:
+        main.CHECKERS["bilibili"] = swap
+
+
+async def test_live_since_survives_reload_and_dirty_data(tmp):
+    """在播状态重启后要能读回起点；关播/无订阅/脏值都要归零。"""
+    now = int(time.time())
+    plugin = build(tmp)
+    plugin.rooms["bilibili:6"] = room_record(
+        live=True, last_live_at=now, live_since=now - 3600
+    )
+    plugin._save()
+    restored = build(tmp)
+    assert restored.rooms["bilibili:6"]["live_since"] == now - 3600
+    assert restored.rooms["bilibili:6"]["live"] is True
+
+    cleaned = plugin._sanitize(
+        {
+            "bilibili:1": room_record(room_id="1", live=True, live_since="abc"),
+            "bilibili:2": room_record(
+                room_id="2",
+                live=False,
+                watchers={USER_UMO: "订阅者"},
+                live_since=now - 3600,
+            ),
+            "bilibili:3": room_record(
+                room_id="3", live=True, watchers={}, live_since=now - 3600
+            ),
+        }
+    )
+    assert cleaned["bilibili:1"]["live_since"] == 0
+    assert cleaned["bilibili:2"]["live_since"] == 0
+    assert cleaned["bilibili:3"]["live_since"] == 0
+
+
 # ---------- 安全与健壮性（代码审查后补的用例） ----------
 
 
@@ -883,21 +1009,31 @@ async def test_save_is_atomic(tmp):
 
 async def test_watcherless_room_loses_live_baseline(tmp):
     """没人订阅就不会再被轮询，上次在播时刻要一并清掉，否则重新订阅后显示假间隔。"""
+    now = int(time.time())
     plugin = build(tmp)
-    plugin.rooms["bilibili:6"] = room_record(last_live_at=1760000000)
+    plugin.rooms["bilibili:6"] = room_record(
+        live=True, last_live_at=now, live_since=now - DAY
+    )
     plugin.rooms["bilibili:6"]["watchers"][ADMIN_UMO] = "管理员"
 
     assert "已取消" in (await run(plugin.cmd_unsub, user(), "6"))[0]
-    assert plugin.rooms["bilibili:6"]["last_live_at"] == 1760000000
+    assert plugin.rooms["bilibili:6"]["last_live_at"] == now
+    assert plugin.rooms["bilibili:6"]["live_since"] == now - DAY
 
     assert "已取消" in (await run(plugin.cmd_unsub, admin(), "6"))[0]
     assert plugin.rooms["bilibili:6"]["watchers"] == {}
     assert plugin.rooms["bilibili:6"]["last_live_at"] == 0
+    assert plugin.rooms["bilibili:6"]["live_since"] == 0
 
     cleaned = plugin._sanitize(
-        {"bilibili:6": room_record(last_live_at=1760000000, watchers={})}
+        {
+            "bilibili:6": room_record(
+                live=True, last_live_at=now, live_since=now - DAY, watchers={}
+            )
+        }
     )
     assert cleaned["bilibili:6"]["last_live_at"] == 0
+    assert cleaned["bilibili:6"]["live_since"] == 0
 
 
 async def test_poll_loop_survives_round_error(tmp):
@@ -957,6 +1093,11 @@ async def main_test():
         ("间隔开关同时管两处", test_elapsed_switch_off_hides_both_fields),
         ("开播通知距离上次直播", test_live_notify_shows_since_last_live),
         ("上次在播时刻持久化", test_last_live_at_survives_reload_and_dirty_data),
+        ("时长格式", test_format_duration_units),
+        ("关播通知本次时长", test_end_notify_shows_session_duration),
+        ("无开播时刻省略时长", test_end_notify_omits_duration_without_start),
+        ("开播起点记录与关播清零", test_live_since_lifecycle),
+        ("开播起点持久化与脏值", test_live_since_survives_reload_and_dirty_data),
         ("房间号字符集校验", test_room_id_charset_rejects_url_injection),
         ("登录Cookie只发B站域名", test_login_cookie_only_goes_to_bilibili),
         ("损坏数据改名留底", test_corrupt_data_is_quarantined),

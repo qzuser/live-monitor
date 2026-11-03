@@ -292,6 +292,27 @@ def format_since(prev_ts, cur_ts=None) -> str:
     return f"{hours // 24}天"
 
 
+def format_duration(seconds) -> str:
+    """把直播时长写成 x天x小时 / x小时y分钟 / y分钟。
+
+    拿不到开播时刻（0）或算出负数（时钟回拨、手工把 live_since 改坏）都返回空串，
+    由调用方省略整行；不满一分钟写"不到1分钟"，免得短播读成空白。
+    """
+    total = _as_int(seconds)
+    if total <= 0:
+        return ""
+    minutes = total // 60
+    if minutes < 1:
+        return "不到1分钟"
+    if minutes < 60:
+        return f"{minutes}分钟"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}小时{mins}分钟" if mins else f"{hours}小时"
+    days, rem = divmod(hours, 24)
+    return f"{days}天{rem}小时" if rem else f"{days}天"
+
+
 def format_upload(up: dict, item: dict, since: str = "") -> str:
     """渲染单条新稿件通知。"""
     lines = [
@@ -609,9 +630,15 @@ class LiveMonitorPlugin(Star):
                 continue
             watchers = self._sanitize_sessions(room.get("watchers"))
             live = room.get("live")
+            live = live if live in (True, False) else None
             # 没有订阅者的房间不会被轮询，留着上次在播时刻只会在重新订阅后
             # 显示一个误导性的"距离上次直播"
             last_live_at = _as_int(room.get("last_live_at")) if watchers else 0
+            # 开播时刻只在确实处于在播时才有意义：状态是关播/首次检测却带着
+            # live_since，下一轮开播会算出一个跨场的假时长
+            live_since = (
+                _as_int(room.get("live_since")) if (watchers and live is True) else 0
+            )
             rooms[str(key)] = {
                 "platform": platform,
                 "room_id": room_id,
@@ -619,10 +646,11 @@ class LiveMonitorPlugin(Star):
                 "anchor": str(room.get("anchor") or ""),
                 "cover": str(room.get("cover") or ""),
                 "url": str(room.get("url") or ""),
-                "live": live if live in (True, False) else None,
+                "live": live,
                 "fails": 0,
                 "watchers": watchers,
                 "last_live_at": last_live_at,
+                "live_since": live_since,
             }
         return rooms
 
@@ -657,7 +685,7 @@ class LiveMonitorPlugin(Star):
         return ups
 
     def _save(self):
-        payload = {"version": 3, "rooms": self.rooms, "ups": self.ups}
+        payload = {"version": 4, "rooms": self.rooms, "ups": self.ups}
         try:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
             # 先写临时文件再改名覆盖：直接 write_text 若在写一半时崩溃，
@@ -850,8 +878,9 @@ class LiveMonitorPlugin(Star):
         room["watchers"].pop(event.unified_msg_origin, None)
         if not room["watchers"]:
             # 没人订阅就不会再被轮询，上次在播的时刻一并清零，
-            # 免得以后重新订阅时显示一个假的"距离上次直播"
+            # 免得以后重新订阅时显示一个假的"距离上次直播"，本轮开播时刻同理
             room["last_live_at"] = 0
+            room["live_since"] = 0
         self._save()
         yield event.plain_result("已取消本会话对该房间的通知。")
 
@@ -982,6 +1011,8 @@ class LiveMonitorPlugin(Star):
                 "fails": 0,
                 # 最近一次看到在播的时刻，用于开播通知里的"距离上次直播"；0 表示没有记录
                 "last_live_at": 0,
+                # 本轮开播的时刻，用于关播通知里的"本次时长"；0 表示没抓到开播时刻
+                "live_since": 0,
             }
             self.rooms[key] = room
         return room
@@ -1199,6 +1230,8 @@ class LiveMonitorPlugin(Star):
             "插件配置 show_elapsed（默认开启）后，开播通知会带上距离上次直播的时间，"
             "稿件通知会带上距上次更新的时间；不满一天按小时显示，"
             "取不到上一次时间时这一行自动省略。\n"
+            "关播通知会带上本次直播时长（x天x小时 / x小时y分钟 / y分钟），"
+            "没抓到这轮开播时刻时省略该行。\n"
             "除 列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
             "通知白名单：插件配置 notify_whitelist，填写允许接收通知的会话UMO，留空不限制。"
         )
@@ -1372,6 +1405,7 @@ class LiveMonitorPlugin(Star):
         now_ts = int(time.time())
         # 先取本次之前的最后一次在播时刻，再刷新它，否则算出来的间隔永远是本轮询周期
         last_live_at = _as_int(room.get("last_live_at"))
+        live_since = _as_int(room.get("live_since"))
         room["title"] = result["title"] or room.get("title", "")
         room["anchor"] = result.get("anchor") or room.get("anchor", "")
         room["cover"] = result.get("cover") or room.get("cover", "")
@@ -1379,6 +1413,14 @@ class LiveMonitorPlugin(Star):
         room["live"] = now
         if now is True:
             room["last_live_at"] = now_ts
+            if prev is False:
+                # 只认真正抓到的开播瞬间；首次检测（prev 是 None）发现房间本来就在播时
+                # 不补记起点，宁可关播时不显示时长，也不报一个从"我发现它"算起的假时长
+                room["live_since"] = live_since = now_ts
+            else:
+                room["live_since"] = live_since
+        else:
+            room["live_since"] = 0
 
         if prev is None:
             # 首次检测只记录基线，不推送
@@ -1401,16 +1443,25 @@ class LiveMonitorPlugin(Star):
             lines += [DIVIDER, f"🔗 {result['url']}"]
             await self._notify(session, room, "\n".join(lines), room.get("cover", ""))
         elif prev is True and now is False and self.conf.get("notify_end", True):
-            text = (
-                "⚫ 关播通知\n"
-                f"{DIVIDER}\n"
-                f"👤 主播：{anchor}\n"
-                f"📡 平台：{pname}\n"
-                f"🚪 房间：{room['room_id']}\n"
-                f"{DIVIDER}\n"
-                "直播已结束，下次开播再会～"
+            # 用"最后一次看到在播的时刻"减"本轮开播的时刻"：真实的关播时刻落在两者之间，
+            # 读数是最接近的下界，误差最多一个关播检测间隔。没抓到开播时刻就不显示，
+            # 否则拿时间戳去减 0 会算出几万天
+            duration = (
+                format_duration(last_live_at - live_since)
+                if live_since and last_live_at > live_since
+                else ""
             )
-            await self._notify(session, room, text, "")
+            lines = [
+                "⚫ 关播通知",
+                DIVIDER,
+                f"👤 主播：{anchor}",
+                f"📡 平台：{pname}",
+                f"🚪 房间：{room['room_id']}",
+            ]
+            if duration:
+                lines.append(f"⏱ 本次时长：约{duration}")
+            lines += [DIVIDER, "直播已结束，下次开播再会～"]
+            await self._notify(session, room, "\n".join(lines), "")
         self._save()
 
     def _notify_whitelist(self) -> set:
