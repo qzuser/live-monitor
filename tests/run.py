@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-SUITES = ("test_monitor", "test_update_check")
+SUITES = ("test_monitor", "test_update_check", "test_self_update")
 
 
 async def run_all():

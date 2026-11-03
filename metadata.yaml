@@ -6,9 +6,10 @@ desc: >-
   以及B站UP主新稿件监控（按 mid 或空间链接添加UP主，发布新视频时推送标题、BV号与封面）。
   可在聊天中通过 /直播监控 添加、删除、订阅监控对象，
   状态变化时自动向订阅的会话推送通知（开播带距离上次直播的时间、关播带本次直播时长），
-  并会定期检查 GitHub 上的插件新版本、有新版本时提醒已订阅的会话。
+  并会定期检查 GitHub 上的插件新版本、有新版本时提醒已订阅的会话；
+  管理员可用 /直播监控 更新 一键下载新版、校验、备份并自动热重载。
 author: pulin
-version: 0.2.1
+version: 0.3.0
 repo: "https://github.com/qzuser/live-monitor"
 support_platforms:
   - aiocqhttp

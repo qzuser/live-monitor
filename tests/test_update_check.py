@@ -97,8 +97,9 @@ async def test_version_compare(tmp):
 
 async def test_meta_comes_from_metadata(tmp):
     """版本号只在 metadata.yaml 维护一份，插件要读对并推出仓库地址。"""
-    version, repo = main.read_plugin_meta()
+    version, repo, name = main.read_plugin_meta()
     assert version, version
+    assert name == "live_monitor", name
     plugin = build(tmp)
     assert plugin.version == version
     assert "live-monitor" in repo and "live-monitor" in plugin._repo_slug

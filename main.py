@@ -1,9 +1,13 @@
+import ast
 import asyncio
 import base64
+import io
 import json
 import os
 import re
+import shutil
 import time
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,6 +39,18 @@ DIVIDER = "────────────────"
 # （此时主动消息通道可能还没就绪），之后按配置项 update_check_interval_hours 定期查。
 UPDATE_FIRST_DELAY = 60
 DEFAULT_UPDATE_INTERVAL_HOURS = 24
+
+# 热更新（/直播监控 更新）：下载包体积上限。插件本体只有几十 KB，
+# 超过这个数说明拿错了东西（比如被代理页替换成了 html），直接放弃。
+MAX_UPDATE_BYTES = 2 * 1024 * 1024
+# 只从更新包里取这些文件覆盖到自己目录：多余的目录、依赖、脚本一律不落地。
+UPDATE_REQUIRED_FILES = ("main.py", "metadata.yaml", "_conf_schema.json")
+UPDATE_OPTIONAL_FILES = ("README.md", "LICENSE")
+UPDATE_BACKUP_KEEP = 5
+# 回复发出去以后到真正调用热重载之间的等待时间。热重载会终止当前实例，
+# 必须留够时间把指令回复推送完，否则管理员看不到结果。
+RELOAD_DELAY = 5.0
+PENDING_UPDATE_FILE = "update_pending.json"
 
 # 与 AstrBot 自带更新器（core/zip_updator.py check_update）保持一致的预发布标签口径，
 # 否则插件提醒的版本和 WebUI 里能更新的版本可能对不上。
@@ -489,25 +505,28 @@ def parse_up_input(text) -> str | None:
     return None
 
 
-def read_plugin_meta() -> tuple[str, str]:
-    """从插件自身目录的 metadata.yaml 读取 (version, repo)。
+def parse_meta_text(text: str) -> dict:
+    """从 metadata.yaml 文本里取出 name / version / repo 三个标量字段。"""
+    fields = {}
+    for key in ("name", "version", "repo"):
+        m = re.search(rf"^{key}:\s*(.+?)\s*$", text, re.MULTILINE)
+        fields[key] = m.group(1).strip("\"'") if m else ""
+    return fields
+
+
+def read_plugin_meta() -> tuple[str, str, str]:
+    """从插件自身目录的 metadata.yaml 读取 (version, repo, name)。
 
     版本号只在 metadata 里维护一份：这里直接解析，避免 main.py 再抄一遍常量后
-    和 metadata.yaml 漂移；顺带把 repo 也取出来当作更新检查的地址来源。
+    和 metadata.yaml 漂移；顺带把 repo 取出来当作更新检查的地址来源、name 取出来
+    当作热重载定位插件的名字来源。
     """
     try:
         text = (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8")
     except Exception:
-        return "", ""
-    version = ""
-    repo = ""
-    m = re.search(r"^version:\s*(\S+)\s*$", text, re.MULTILINE)
-    if m:
-        version = m.group(1).strip("\"'")
-    m = re.search(r"^repo:\s*(.+?)\s*$", text, re.MULTILINE)
-    if m:
-        repo = m.group(1).strip("\"'")
-    return version, repo
+        return "", "", ""
+    fields = parse_meta_text(text)
+    return fields["version"], fields["repo"], fields["name"]
 
 
 def parse_version(text) -> tuple:
@@ -535,20 +554,182 @@ def monitor_group():
     """直播监控指令组"""
 
 
+def pick_update_asset(item: dict) -> dict:
+    """从 Release 里挑要下载的更新包。
+
+    优先本插件自己上传的 live_monitor_v*.zip（只含 4 个插件文件），没有就退回
+    GitHub 自动生成的源码包 zipball_url。带 size 且明显超限的资产直接跳过，
+    省得把一个不相干的大文件拉下来。
+    """
+    assets = item.get("assets")
+    candidates = (
+        [a for a in assets if isinstance(a, dict)] if isinstance(assets, list) else []
+    )
+    for key in (r"^live_monitor_v?[\d.]+\.zip$", r"^live[\w.-]*\.zip$"):
+        pattern = re.compile(key, re.IGNORECASE)
+        for asset in candidates:
+            name = str(asset.get("name") or "")
+            url = str(asset.get("browser_download_url") or "")
+            if not pattern.match(name) or not url.startswith("https://"):
+                continue
+            if _as_int(asset.get("size")) > MAX_UPDATE_BYTES:
+                continue
+            return {"url": url, "name": name}
+    zipball = str(item.get("zipball_url") or "")
+    if zipball.startswith("https://"):
+        return {"url": zipball, "name": "源码包"}
+    return {}
+
+
+def _safe_entry_path(name: str) -> str:
+    """把 zip 里的条目名规范成正斜杠相对路径，越界的一律判非法。"""
+    path = str(name).replace("\\", "/")
+    if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+        return ""
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return ""
+    return "/".join(parts)
+
+
+def find_update_root(entries: list):
+    """定位插件文件所在目录：本插件的 zip 是平铺的，GitHub 源码包多一层同名目录。
+
+    以 metadata.yaml 所在的那一层为根，只接受根目录或一层目录，避免把子目录里的
+    同名文件当成插件本体。找不到返回 None，由调用方报错。
+    """
+    best = None
+    prefix = ""
+    for entry in entries:
+        parts = entry.split("/")
+        if parts[-1] != "metadata.yaml":
+            continue
+        depth = len(parts) - 1
+        if depth > 1:
+            continue
+        if best is None or depth < best:
+            best = depth
+            prefix = "" if depth == 0 else parts[0]
+    if best is None:
+        return None
+    return prefix
+
+
+def inspect_update_zip(data: bytes, cur_name: str, cur_version: str) -> dict:
+    """在内存里校验更新包，返回 {version, files}；不通过就抛 ValueError 说明原因。
+
+    覆盖插件目录等于让下载来的代码在机器人进程里跑，所以先把住几道关：包结构
+    合法、路径不越界、插件名没被换成别的项目、版本号确实更新、main.py 能编译且
+    找得到 Star 插件主类、schema 是合法 JSON。只读白名单文件，包里的其他条目
+    一个字节都不落盘。
+    """
+    if len(data) > MAX_UPDATE_BYTES:
+        raise ValueError(f"更新包超过 {MAX_UPDATE_BYTES // 1024 // 1024}MB 上限")
+    if data[:2] != b"PK":
+        raise ValueError("更新包不是 zip 格式")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as e:
+        raise ValueError(f"更新包打不开: {e}")
+    with archive as zf:
+        entries = {}
+        for info in zf.infolist():
+            path = _safe_entry_path(info.filename)
+            if not path:
+                raise ValueError(f"更新包里有非法路径: {info.filename}")
+            if not path.startswith("__MACOSX/"):
+                entries[path] = info
+        root = find_update_root(list(entries))
+        if root is None:
+            if not any(p.split("/")[-1] == "metadata.yaml" for p in entries):
+                raise ValueError("更新包缺少 metadata.yaml，不是插件包")
+            raise ValueError("更新包里的 metadata.yaml 层级太深，无法确定插件目录")
+        files = {}
+        for fname in UPDATE_REQUIRED_FILES:
+            path = f"{root}/{fname}" if root else fname
+            info = entries.get(path)
+            if info is None:
+                raise ValueError(f"更新包缺少 {fname}")
+            if info.file_size > MAX_UPDATE_BYTES:
+                raise ValueError(f"更新包里的 {fname} 体积异常")
+            files[fname] = zf.read(info)
+        for fname in UPDATE_OPTIONAL_FILES:
+            path = f"{root}/{fname}" if root else fname
+            info = entries.get(path)
+            if info is not None and info.file_size <= MAX_UPDATE_BYTES:
+                files[fname] = zf.read(info)
+    try:
+        meta_text = files["metadata.yaml"].decode("utf-8")
+    except Exception:
+        raise ValueError("更新包里的 metadata.yaml 不是 UTF-8 文本")
+    meta = parse_meta_text(meta_text)
+    if not meta["name"]:
+        raise ValueError("更新包的 metadata.yaml 缺少 name")
+    if cur_name and meta["name"] != cur_name:
+        raise ValueError(f"更新包的插件名是 {meta['name']}，不是本插件 {cur_name}")
+    if not meta["version"]:
+        raise ValueError("更新包的 metadata.yaml 缺少 version")
+    if not version_is_newer(meta["version"], cur_version):
+        raise ValueError(f"更新包版本 {meta['version']} 不比当前版本 {cur_version} 新")
+    try:
+        json.loads(files["_conf_schema.json"].decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"更新包里的 _conf_schema.json 不是合法 JSON: {e}")
+    try:
+        tree = ast.parse(files["main.py"].decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"更新包里的 main.py 语法不通过: {e}")
+    if not _has_plugin_class(tree):
+        raise ValueError(
+            "更新包里的 main.py 找不到以 Plugin 结尾的主类，装上也不会被加载"
+        )
+    return {"version": meta["version"], "files": files}
+
+
+def _has_plugin_class(tree: ast.AST) -> bool:
+    """main.py 里必须有一个名字以 Plugin 结尾的类，这是 AstrBot 扫描插件的硬条件。"""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name.endswith("Plugin"):
+            return True
+    return False
+
+
+def prune_update_backups(backup_root: Path, keep: int = UPDATE_BACKUP_KEEP):
+    """备份只留最近 keep 份，其余删掉。备份是本插件自己的目录副本，不需要长期留。"""
+    try:
+        dirs = sorted(
+            [p for p in backup_root.iterdir() if p.is_dir()],
+            key=lambda p: p.name,
+            reverse=True,
+        )
+    except Exception:
+        return
+    for stale in dirs[keep:]:
+        try:
+            shutil.rmtree(stale)
+        except Exception:
+            pass
+
+
 _poll_task: asyncio.Task | None = None
 """模块级后台任务引用。热重载时模块会被重新导入，旧引用随之失效，
 因此必须在创建新任务前取消它，防止新旧两个轮询任务并发导致重复推送。"""
+
+_reload_task: asyncio.Task | None = None
+"""热更新排队中的重载任务引用，防止连续两次 更新 指令排出两个重载。"""
 
 
 class LiveMonitorPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.conf = config or {}
-        self.data_file: Path = StarTools.get_data_dir() / "rooms.json"
+        self.data_dir: Path = StarTools.get_data_dir()
+        self.data_file: Path = self.data_dir / "rooms.json"
+        self.plugin_dir = Path(__file__).parent
         self.rooms: dict = {}
         self.ups: dict = {}
         self._last_check: dict[str, float] = {}
-        self.version, repo_url = read_plugin_meta()
+        self.version, repo_url, self.meta_name = read_plugin_meta()
         m = GITHUB_REPO_RE.search(repo_url)
         self._repo_slug = f"{m.group(1)}/{m.group(2)}" if m else ""
         self._repo_page = (
@@ -556,6 +737,7 @@ class LiveMonitorPlugin(Star):
         )
         self._next_update_check = time.monotonic() + UPDATE_FIRST_DELAY
         self._update_hint_version = ""
+        self._pending_update = self._read_pending_update()
         self._load()
         global _poll_task
         if _poll_task is not None and not _poll_task.done():
@@ -1126,8 +1308,10 @@ class LiveMonitorPlugin(Star):
             lines.extend(body[:6])
         lines.append(DIVIDER)
         lines.append(
-            "更新方式：AstrBot WebUI → 插件管理 → 本插件 → 更新"
-            "（由 AstrBot 覆盖插件目录，监控数据在 data/plugin_data 下不受影响）"
+            f"更新方式：管理员在群里发 /直播监控 更新 即可自动下载并热更新到 v"
+            f"{release['version'].lstrip('v') or '?'}；"
+            "也可用 AstrBot WebUI → 插件管理 → 本插件 → 更新"
+            "（监控数据在 data/plugin_data 下，两种方式都不受影响）"
         )
         return "\n".join(lines)
 
@@ -1204,6 +1388,322 @@ class LiveMonitorPlugin(Star):
         self._update_hint_version = release["version"]
         yield event.plain_result(self._update_text(release, "🆕 发现新版本"))
 
+    # ---------- 插件热更新（下载 -> 校验 -> 覆盖 -> 重载） ----------
+
+    def _plugin_name(self) -> str:
+        """AstrBot 注册用的插件名，热重载靠它定位自己。
+
+        优先问 Context 要本实例对应的 StarMetadata：loader 注入的名字才是 reload
+        认的那个（插件目录名和 metadata.name 不一致时以注册名为准）；拿不到就退回
+        metadata.yaml 里的 name。
+        """
+        try:
+            for star in self.context.get_all_stars():
+                if getattr(star, "star_cls", None) is self:
+                    return str(getattr(star, "name", "") or "") or self.meta_name
+        except Exception:
+            pass
+        return self.meta_name
+
+    def _pending_file(self) -> Path:
+        return self.data_dir / PENDING_UPDATE_FILE
+
+    def _read_pending_update(self):
+        """读上次热更新留下的标记；标记本身坏了就当没有，不能连累监控启动。"""
+        try:
+            path = self._pending_file()
+            if not path.exists():
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not raw.get("to"):
+                return None
+            return raw
+        except Exception as e:
+            self.logger.warning(f"读取更新标记失败: {e}")
+            return None
+
+    def _write_pending_update(self, to: str, umo: str, backup: str):
+        marker = {
+            "from": self.version,
+            "to": to,
+            "umo": umo,
+            "backup": backup,
+            "at": int(time.time()),
+        }
+        try:
+            self._pending_file().write_text(
+                json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            self.logger.warning(f"写入更新标记失败，重载后不会有确认消息: {e}")
+
+    def _clear_pending_update(self):
+        try:
+            path = self._pending_file()
+            if path.exists():
+                os.remove(path)
+        except Exception as e:
+            self.logger.warning(f"清理更新标记失败: {e}")
+
+    async def _confirm_update(self):
+        """热重载后的第一次轮询里把结果回执给发起更新的会话，随后删掉标记。"""
+        marker = self._pending_update
+        self._pending_update = None
+        self._clear_pending_update()
+        to = str(marker.get("to") or "")
+        backup = str(marker.get("backup") or "")
+        umo = str(marker.get("umo") or "")
+        done = parse_version(self.version) == parse_version(to)
+        lines = []
+        if done:
+            lines += [
+                f"✅ 已更新到 v{to.lstrip('vV')} 并完成热重载",
+                DIVIDER,
+                f"📦 原版本：v{marker.get('from') or '未知'}",
+            ]
+            if backup:
+                lines.append(f"🗂 旧版备份：{backup}")
+            lines.append("监控与订阅数据未受影响。")
+            self.logger.info(f"热更新完成：v{marker.get('from')} -> v{to}")
+        else:
+            lines += [
+                "⚠️ 插件文件已覆盖，但没能载入新版本",
+                DIVIDER,
+                f"🎯 目标版本：v{to.lstrip('vV')}",
+                f"📦 当前载入：v{self.version or '未知'}",
+            ]
+            if backup:
+                lines.append(f"🗂 旧版备份：{backup}")
+            lines += [
+                "请到 AstrBot WebUI → 插件管理 重载本插件看报错；",
+                "仍然失败就用备份目录覆盖插件目录回滚。",
+            ]
+            self.logger.error(f"热更新未生效：目标 v{to}，实际 v{self.version}")
+        if not umo:
+            return
+        whitelist = self._notify_whitelist()
+        if whitelist and umo not in whitelist:
+            self.logger.info(f"以下会话不在 notify_whitelist 内，跳过推送: [{umo}]")
+            return
+        await self._send(umo, [Plain("\n".join(lines))])
+
+    def _download_url(self, url: str) -> str:
+        """拼上可选的加速前缀。国内直连 GitHub 下载经常断，给个镜像口子，
+        但只许 https，免得把更新包重定向到明文源。"""
+        proxy = str(self.conf.get("update_asset_proxy") or "").strip()
+        if not proxy:
+            return url
+        if not proxy.startswith("https://"):
+            raise ValueError("update_asset_proxy 必须以 https:// 开头")
+        return f"{proxy.rstrip('/')}/{url}"
+
+    async def _download_update_archive(self, session, url: str) -> bytes:
+        target = self._download_url(url)
+        async with session.get(
+            target, headers=GITHUB_HEADERS, timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"下载更新包 HTTP {resp.status}")
+            if (resp.content_length or 0) > MAX_UPDATE_BYTES:
+                raise ValueError(f"更新包过大: {resp.content_length} 字节")
+            data = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                data += chunk
+                # 响应头不报长度的（分块传输）只能边读边卡，防止无限吃内存
+                if len(data) > MAX_UPDATE_BYTES:
+                    raise ValueError(
+                        f"更新包超过 {MAX_UPDATE_BYTES // 1024 // 1024}MB 上限，已放弃"
+                    )
+        return bytes(data)
+
+    def _install_update(self, files: dict) -> str:
+        """先备份再逐个原子覆盖，返回备份目录路径（备份没做成返回空串）。
+
+        只覆盖更新包里带回来的那几个文件，绝不删插件目录：AstrBot 自带的更新器
+        是 remove_dir + 解压，一旦新版加载不起来手工回滚就很麻烦，这里刻意留
+        「用备份目录盖回来」这条退路。
+        """
+        backup_dir = None
+        root = self.data_dir / "backup"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            backup_dir = (
+                root / f"v{self.version or 'unknown'}-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.logger.warning(f"创建更新备份目录失败，本次更新不留旧版副本: {e}")
+        if backup_dir is not None:
+            for name in files:
+                src = self.plugin_dir / name
+                if not src.exists():
+                    continue
+                try:
+                    shutil.copy2(src, backup_dir / name)
+                except Exception as e:
+                    self.logger.warning(f"备份 {name} 失败: {e}")
+            prune_update_backups(root)
+        for name, data in files.items():
+            target = self.plugin_dir / name
+            tmp = target.with_name(target.name + ".update-tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, target)
+        return str(backup_dir) if backup_dir else ""
+
+    def _reload_blocker(self) -> str:
+        """能不能自动热重载；返回不能的原因，空串表示可以。
+
+        reload(name) 匹配不到名字时会退化成重载**所有**插件，所以必须先用公开接口
+        确认这个名字确实注册过，绝不能拿个错名字去调。
+        """
+        name = self._plugin_name()
+        if not name:
+            return "拿不到 AstrBot 注册的插件名"
+        manager = getattr(self.context, "_star_manager", None)
+        if manager is None or not hasattr(manager, "reload"):
+            return "当前 AstrBot 版本没有向插件暴露热重载接口"
+        try:
+            registered = self.context.get_registered_star(name)
+        except Exception:
+            registered = None
+        if registered is None:
+            return f"插件名 {name} 没有在 AstrBot 注册"
+        return ""
+
+    def _schedule_reload(self) -> str:
+        """把热重载排进独立任务，返回不能自动重载的原因（空串表示已排队）。
+
+        不能在指令协程里直接 await reload：那一步会终止当前实例，本条指令的回复
+        就发不出去了。
+        """
+        blocker = self._reload_blocker()
+        if blocker:
+            return blocker
+        global _reload_task
+        if _reload_task is not None and not _reload_task.done():
+            return ""  # 已经有一次重载在排队
+        manager = self.context._star_manager
+        name = self._plugin_name()
+        _reload_task = asyncio.create_task(self._reload_later(manager, name))
+        return ""
+
+    async def _reload_later(self, manager, name: str):
+        try:
+            await asyncio.sleep(RELOAD_DELAY)
+            success, error = await manager.reload(name)
+            if success:
+                self.logger.info(f"插件 {name} 已热重载，等待新版回报")
+            else:
+                self.logger.error(f"插件 {name} 热重载失败: {error}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.error(f"热重载插件异常: {e!r}")
+
+    def _pick_target(self, releases: list, want: str) -> dict | None:
+        """want 为空取最新正式版；指定版本号时按 tag 精确匹配（可指名 prerelease）。"""
+        if not want:
+            return self._pick_release(releases)
+        want_num = want.lstrip("vV")
+        for item in releases:
+            if not isinstance(item, dict) or item.get("draft"):
+                continue
+            tag = str(item.get("tag_name") or "")
+            if tag and tag.lstrip("vV") == want_num:
+                return item
+        return None
+
+    async def _perform_update(self, want: str, umo: str) -> tuple[bool, str]:
+        """下载、校验、覆盖、排队重载；返回 (是否成功, 回给管理员的文本)。"""
+        backup = ""
+        try:
+            async with aiohttp.ClientSession() as session:
+                releases = await self._fetch_releases(session)
+                item = self._pick_target(releases, want)
+                if not item:
+                    where = f"{want} 这个版本" if want else "仓库上"
+                    return False, f"{where}没有可用的 Release，无法更新。"
+                release = self._release_info(item)
+                to = release["version"]
+                if parse_version(to) == parse_version(self.version):
+                    return False, f"当前已经是 v{self.version}，无需更新。"
+                if not version_is_newer(to, self.version):
+                    return False, (
+                        f"目标版本 {to} 比当前 v{self.version} 旧：热更新只往前装，"
+                        "回滚请用备份目录覆盖插件目录，或在 WebUI 里手工装旧版。"
+                    )
+                asset = pick_update_asset(item)
+                if not asset:
+                    return False, (
+                        f"{to} 这个 Release 上没有可下载的更新包"
+                        "（既没有 live_monitor_v*.zip 也没有源码包地址）。"
+                    )
+                data = await self._download_update_archive(session, asset["url"])
+            try:
+                info = inspect_update_zip(data, self.meta_name, self.version)
+            except ValueError as e:
+                return False, f"更新包校验未通过，已放弃覆盖：{e}"
+            try:
+                backup = self._install_update(info["files"])
+            except Exception as e:
+                return False, (
+                    f"覆盖插件文件时出错（可能只写了一部分）: {e}\n"
+                    f"🗂 旧版备份：{backup or '未生成'}\n"
+                    "请先在 WebUI 里用备份目录覆盖插件目录，再重载插件。"
+                )
+        except Exception as e:
+            return False, f"更新失败: {e}"
+        self._update_hint_version = to
+        self._write_pending_update(info["version"], umo, backup)
+        blocker = self._schedule_reload()
+        lines = [
+            f"✅ 已下载 v{info['version'].lstrip('vV')} 并覆盖 {len(info['files'])} 个文件",
+            DIVIDER,
+            f"📦 原版本：v{self.version}",
+            f"📥 更新包：{asset['name']}",
+        ]
+        if backup:
+            lines.append(f"🗂 旧版备份：{backup}")
+        lines.append(DIVIDER)
+        if blocker:
+            lines += [
+                f"⚠️ 自动热重载不可用（{blocker}），文件已经换成新版了，",
+                "请立刻到 AstrBot WebUI → 插件管理 手动重载插件。",
+            ]
+        else:
+            lines.append(
+                f"♻️ {RELOAD_DELAY:.0f} 秒后自动热重载，重载成功后本会话会再收到一条确认；"
+                "没收到就去 WebUI → 插件管理 看原因，必要时用备份回滚。"
+            )
+        return True, "\n".join(lines)
+
+    @monitor_group.command("更新")
+    async def cmd_update(self, event, target_version: str | None = None):
+        """下载最新版并自动热更新插件。用法: /直播监控 更新 [版本号]"""
+        if deny := self._admin_only(event):
+            yield deny
+            return
+        if not self.conf.get("self_update", True):
+            yield event.plain_result(
+                "插件配置 self_update 已关闭，不允许自动下载覆盖插件文件。\n"
+                "要更新请在 WebUI 插件设置里打开 self_update，"
+                "或用 /直播监控 检查更新 查版本号后手工更新。"
+            )
+            return
+        if not self._repo_slug or not self.version:
+            yield event.plain_result(
+                "metadata.yaml 里没有可用的 version / repo，无法更新。"
+            )
+            return
+        want = str(target_version or "").strip()
+        yield event.plain_result(
+            f"⏬ 正在从 {self._repo_page} 下载{' ' + want if want else '最新版'}更新包…"
+        )
+        ok, text = await self._perform_update(want, event.unified_msg_origin)
+        if ok:
+            self.logger.info(f"管理员 {event.get_sender_id()} 触发热更新成功：{text}")
+        yield event.plain_result(text)
+
     @monitor_group.command("帮助")
     async def cmd_help(self, event):
         """查看直播监控帮助"""
@@ -1223,6 +1723,9 @@ class LiveMonitorPlugin(Star):
             "—— 通用 ——\n"
             "列表  查看监控的直播间与UP主\n"
             "检查更新  立即查一次 GitHub 上有没有新版插件（管理员）\n"
+            "更新 [版本号]  从 GitHub 下载更新包、覆盖插件文件并自动热重载（管理员）；"
+            "带版本号可指名要装的版本但必须比当前新，回滚请用备份目录；"
+            "插件配置 self_update 可关闭该能力\n"
             "支持平台: B站直播(bili)、斗鱼(douyu)、虎牙(huya/hy)、抖音(douyin)；"
             "UP主稿件仅支持B站。\n"
             "开播/关播会推送主播名、房间号、标题、链接与封面；"
@@ -1285,6 +1788,10 @@ class LiveMonitorPlugin(Star):
 
     async def _poll_once(self, session: aiohttp.ClientSession):
         now = time.monotonic()
+        if self._pending_update is not None:
+            # 热重载后的第一次轮询：先回报更新结果。放在这里而不是 __init__ 里，
+            # 是因为插件刚加载时主动消息通道可能还没就绪
+            await self._confirm_update()
         if self.conf.get("update_check", True) and (now >= self._next_update_check):
             await self._check_plugin_update(session, now)
         due = []

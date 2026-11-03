@@ -72,11 +72,17 @@ class Logger:
 
 
 class Context:
-    """假的 AstrBot Context：记录所有主动消息，fail 里的 UMO 一律抛错。"""
+    """假的 AstrBot Context：记录所有主动消息，fail 里的 UMO 一律抛错。
 
-    def __init__(self, fail=()):
+    stars 用来模拟 loader 的插件注册表（热重载要靠它确认插件名真的注册过）；
+    _star_manager 默认 None，即"这个版本的 Context 没有暴露热重载接口"。
+    """
+
+    def __init__(self, fail=(), stars=None):
         self.sent = []
         self.fail = set(fail)
+        self.stars = list(stars or [])
+        self._star_manager = None
 
     async def send_message(self, umo, chain):
         if umo in self.fail:
@@ -93,6 +99,24 @@ class Context:
 
     def clear(self):
         self.sent.clear()
+
+    def get_all_stars(self):
+        return self.stars
+
+    def get_registered_star(self, name):
+        for star in self.stars:
+            if star.name == name:
+                return star
+        return None
+
+
+class StarMeta:
+    """假 StarMetadata：只需要 name / star_cls 两个字段。"""
+
+    def __init__(self, name, star_cls=None):
+        self.name = name
+        self.star_cls = star_cls
+        self.module_path = f"data.plugins.{name}.main"
 
 
 class Star:
@@ -246,14 +270,24 @@ async def _idle_poll(self):
     await asyncio.sleep(3600)
 
 
-def build(tmp, conf=None, fail=(), poll=False):
-    """构造插件实例。默认把后台轮询换成空转，只有 poll=True 时才跑真实轮询循环。"""
+def build(tmp, conf=None, fail=(), poll=False, stars=None):
+    """构造插件实例。默认把后台轮询换成空转，只有 poll=True 时才跑真实轮询循环。
+
+    plugin_dir 指到临时目录里：热更新用例会真的覆盖文件，绝不能碰仓库里的 main.py。
+    stars 默认把本实例按 metadata 里的插件名注册进假 Context，传 [] 表示没注册。
+    """
     StarTools.data_dir = Path(tmp)
     main.LiveMonitorPlugin._poll_loop = REAL_POLL if poll else _idle_poll
     try:
         plugin = main.LiveMonitorPlugin(Context(fail=fail), conf or {})
     finally:
         main.LiveMonitorPlugin._poll_loop = _idle_poll
+    plugin.plugin_dir = Path(tmp) / "plugin"
+    plugin.plugin_dir.mkdir(parents=True, exist_ok=True)
+    if stars is None:
+        plugin.context.stars = [StarMeta(plugin.meta_name, plugin)]
+    else:
+        plugin.context.stars = list(stars)
     return plugin
 
 

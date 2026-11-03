@@ -70,5 +70,15 @@
     "description": "自动检查新版本的间隔（小时）。插件启动约 1 分钟后做第一次检查，之后按此间隔轮询。最小生效 1 小时，过小会被 GitHub API 限流",
     "type": "int",
     "default": 24
+  },
+  "self_update": {
+    "description": "是否允许 /直播监控 更新 从 GitHub 下载更新包、覆盖插件文件并自动热重载。只影响管理员手工触发的这条指令，插件不会自己偷偷更新；关闭后仍可用 /直播监控 检查更新 查版本号再手工更新",
+    "type": "bool",
+    "default": true
+  },
+  "update_asset_proxy": {
+    "description": "下载更新包时的加速/镜像前缀（可选，必须以 https:// 开头）。填了就把 GitHub 的下载地址拼在前缀后面，例如 https://mirror.example.com；留空则直连 GitHub",
+    "type": "string",
+    "default": ""
   }
 }
