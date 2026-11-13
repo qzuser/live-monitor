@@ -89,15 +89,15 @@ async def stop_poll(task):
 
 
 async def test_legacy_flat_data_upgraded(tmp):
-    """0.1.1 的扁平 rooms.json 要能读出来，并写成 v4 结构。"""
+    """0.1.1 的扁平 rooms.json 要能读出来，并写成 v5 结构。"""
     write_data(tmp, {"bilibili:6": room_record(title="老标题")})
     plugin = build(tmp)
     assert plugin.rooms["bilibili:6"]["title"] == "老标题"
     assert plugin.ups == {}
     await run(plugin.cmd_del, admin(), "bilibili:6")
     payload = read_data(tmp)
-    assert payload["version"] == 4
-    assert set(payload) == {"version", "rooms", "ups"}
+    assert payload["version"] == 5
+    assert set(payload) == {"version", "rooms", "ups", "notify_over"}
 
 
 async def test_v2_submission_data_is_dropped(tmp):
@@ -126,7 +126,7 @@ async def test_v2_submission_data_is_dropped(tmp):
     assert "投稿队列" in logs, plugin.logger.messages
     assert "监控UP" in logs, plugin.logger.messages
     await run(plugin.cmd_add_up, admin(), MID)  # 触发一次落盘
-    assert set(read_data(tmp)) == {"version", "rooms", "ups"}
+    assert set(read_data(tmp)) == {"version", "rooms", "ups", "notify_over"}
 
 
 async def test_corrupted_up_data_is_dropped(tmp):
@@ -363,8 +363,9 @@ async def test_seen_history_is_capped(tmp):
 
 
 class _Resp:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
 
     async def __aenter__(self):
         return self

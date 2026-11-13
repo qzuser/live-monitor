@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import aiohttp
 from astrbot.api.event import MessageChain, filter
@@ -28,10 +29,42 @@ MAX_COVER_BYTES = 2 * 1024 * 1024
 
 # UP 主稿件历史只用于去重，保留最近这么多条即可覆盖几次漏检，不能让列表无限增长。
 MAX_SEEN_UPLOADS = 60
+# 动态比稿件频繁得多，去重历史同样要封顶
+MAX_SEEN_DYNAMICS = 60
 # 一次检查最多单独推送几条新稿件。UP 主批量补档时会一次冒出一堆，超过就合并成一条。
 DEFAULT_UPLOAD_MAX_NOTIFY = 3
 DEFAULT_UPLOAD_INTERVAL = 300
 MIN_UPLOAD_INTERVAL = 60
+# 动态里认不出的类型（B站后续新增的）按这个标签处理
+DEFAULT_DYNAMIC_KIND = "动态"
+
+# /直播监控 通知 能改的开关：显示名 -> 对应的配置项键名。这些开关只在运行时覆盖，
+# 不动插件配置文件，管理员在聊天里就能关推送，改完立刻对轮询生效。
+NOTIFY_FLAGS = {
+    "开播": "notify_start",
+    "关播": "notify_end",
+    "稿件": "notify_upload",
+    "动态": "notify_dynamic",
+    "新版提醒": "update_check",
+    "间隔显示": "show_elapsed",
+}
+# 会话里可能打的简写，一并认下来
+NOTIFY_ALIASES = {
+    "开播通知": "开播",
+    "关播通知": "关播",
+    "投稿": "稿件",
+    "稿件通知": "稿件",
+    "更新": "新版提醒",
+    "新版本": "新版提醒",
+    "更新提醒": "新版提醒",
+    "距离上次": "间隔显示",
+    "时间间隔": "间隔显示",
+}
+# 各开关在配置文件里的默认值，必须与 _conf_schema.json 一致：
+# 动态比稿件吵得多，默认不开，读错默认值会让测试与线上行为对不上。
+NOTIFY_DEFAULTS = {"notify_dynamic": False}
+# 开关参数认不出来时的标记。不能用 False 代替：关 本身就是个合法值。
+_FLAG_UNKNOWN = object()
 
 DIVIDER = "────────────────"
 
@@ -126,7 +159,14 @@ async def _get_json(session: aiohttp.ClientSession, url: str, headers: dict):
     async with session.get(
         url, headers=headers, timeout=aiohttp.ClientTimeout(10)
     ) as resp:
-        return await resp.json(**_get_json_kwargs())
+        if resp.status != 200:
+            # 平台风控时常直接回 412/403 的网页，这里不拦一下就会变成
+            # "Expecting value: line 1 column 1" 这种看不出所以然的日志
+            raise RoomCheckError(f"接口返回 HTTP {resp.status}（可能被风控或限流）")
+        try:
+            return await resp.json(**_get_json_kwargs())
+        except Exception as e:
+            raise RoomCheckError(f"接口返回的不是 JSON（可能被风控拦截）: {e!r}") from e
 
 
 async def check_bilibili(
@@ -199,6 +239,16 @@ def _space_headers(cookie: str = "") -> dict:
     h["Referer"] = "https://space.bilibili.com/"
     if cookie:
         h["Cookie"] = cookie
+    return h
+
+
+def _dynamic_headers(mid: str, cookie: str = "") -> dict:
+    """动态列表接口的请求头：Referer 要指到该UP主的动态页。
+
+    只写空间首页会被判成异常来源，接口直接回 HTML 风控页而不是 JSON。
+    """
+    h = _space_headers(cookie)
+    h["Referer"] = f"https://space.bilibili.com/{mid}/dynamic"
     return h
 
 
@@ -276,6 +326,335 @@ async def fetch_up_uploads(
         older = uploads[idx + 1] if idx + 1 < len(uploads) else None
         current["prev_pubtime"] = older["pubtime"] if older else 0
     return uploads
+
+
+# ---------- B站动态（空间动态流） ----------
+
+# WBI 签名的重排表，是B站前端写死的常量表，算法本身不保密：
+# 参数排序拼串后拼上这个 key 取 md5 当 w_rid，缺一步就返回 -352。
+WBI_MIXIN_TAB = (
+    46,
+    47,
+    18,
+    2,
+    53,
+    8,
+    23,
+    32,
+    15,
+    50,
+    10,
+    31,
+    58,
+    3,
+    45,
+    35,
+    27,
+    43,
+    5,
+    49,
+    33,
+    9,
+    42,
+    19,
+    29,
+    28,
+    14,
+    39,
+    12,
+    38,
+    41,
+    13,
+    37,
+    48,
+    7,
+    16,
+    24,
+    55,
+    40,
+    61,
+    26,
+    17,
+    0,
+    1,
+    60,
+    51,
+    30,
+    4,
+    22,
+    25,
+    54,
+    21,
+    56,
+    59,
+    6,
+    63,
+    57,
+    62,
+    11,
+    36,
+    20,
+    34,
+    44,
+    52,
+)
+DYNAMIC_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
+WBI_NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
+BUVID_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+# nav 返回的签名密钥每天轮换，缓存一小时既省请求又不会过期
+WBI_KEY_TTL = 3600
+BUVID_TTL = 86400
+# 风控软失败会返回 code=0 但 items 为空，重试几次再认，免得把"空"当成基线
+DYNAMIC_EMPTY_RETRY = 3
+
+_wbi_cache = {"mixin": "", "ts": 0.0}
+_buvid_cache = {"value": "", "ts": 0.0}
+
+# 动态类型 -> 通知里显示的种类名
+DYNAMIC_KINDS = {
+    "DYNAMIC_TYPE_AV": "视频",
+    "DYNAMIC_TYPE_DRAW": "图文",
+    "DYNAMIC_TYPE_OPUS": "图文",
+    "DYNAMIC_TYPE_ARTICLE": "专栏",
+    "DYNAMIC_TYPE_FORWARD": "转发",
+    "DYNAMIC_TYPE_REGULAR_DYNAMIC": "纯文字",
+    "DYNAMIC_TYPE_LIVE_RCMD": "直播",
+    "DYNAMIC_TYPE_LIVING_RCMD": "直播",
+    "DYNAMIC_TYPE_PGC": "番剧",
+    "DYNAMIC_TYPE_MUSIC": "音乐",
+    "DYNAMIC_TYPE_COURSES": "课程",
+    "DYNAMIC_TYPE_COMMON_VIRTUAL": "预约",
+    "DYNAMIC_TYPE_WATCH_LATER": "动态",
+}
+
+
+def _wbi_mixin_key(img_key: str, sub_key: str) -> str:
+    raw = f"{img_key}{sub_key}"
+    return "".join(raw[i] for i in WBI_MIXIN_TAB if i < len(raw))[:32]
+
+
+def _wbi_signed_query(params: dict, mixin: str) -> str:
+    """按B站前端的口径给参数加 w_rid/wts。
+
+    参与签名的值要先剔除 !'()* 这几个字符（urlencode 前后口径必须一致，否则
+    服务端算出的 md5 对不上），签名用的串不含 w_rid，最后再把 w_rid 一起编码。
+    """
+    q = dict(params)
+    q["wts"] = int(time.time())
+    cleaned = {
+        key: "".join(c for c in str(q[key]) if c not in "!'()*") for key in sorted(q)
+    }
+    query = urlencode(cleaned)
+    q["w_rid"] = hashlib.md5((query + mixin).encode("utf-8")).hexdigest()
+    return urlencode(dict(sorted(q.items())))
+
+
+async def fetch_wbi_mixin(session: aiohttp.ClientSession, cookie: str = "") -> str:
+    """取动态接口的签名密钥。B站一天只换几次，缓存起来省掉一次 nav 请求。"""
+    now = time.time()
+    if _wbi_cache["mixin"] and now - _wbi_cache["ts"] < WBI_KEY_TTL:
+        return _wbi_cache["mixin"]
+    data = await _get_json(session, WBI_NAV_URL, _space_headers(cookie))
+    wbi = (data.get("data") or {}).get("wbi_img") or {}
+    img_key = str(wbi.get("img_url") or "").rsplit("/", 1)[-1].split(".")[0]
+    sub_key = str(wbi.get("sub_url") or "").rsplit("/", 1)[-1].split(".")[0]
+    mixin = _wbi_mixin_key(img_key, sub_key)
+    if len(mixin) < 32:
+        raise RoomCheckError("取不到B站 WBI 签名密钥，动态接口无法调用")
+    _wbi_cache["mixin"] = mixin
+    _wbi_cache["ts"] = time.time()
+    return mixin
+
+
+async def fetch_buvid3(session: aiohttp.ClientSession) -> str:
+    """取一个匿名访客的 buvid3。动态接口没有它会直接 -352，取到后尽量复用。"""
+    now = time.time()
+    if _buvid_cache["value"] and now - _buvid_cache["ts"] < BUVID_TTL:
+        return _buvid_cache["value"]
+    try:
+        data = await _get_json(session, BUVID_SPI_URL, _space_headers(""))
+        b3 = str(((data.get("data") or {}).get("b_3")) or "")
+    except Exception:
+        b3 = ""
+    if b3:
+        _buvid_cache["value"] = b3
+        _buvid_cache["ts"] = now
+    return _buvid_cache["value"]
+
+
+async def _dynamic_cookie(session: aiohttp.ClientSession, cookie: str) -> str:
+    """动态接口用的 Cookie：用户 Cookie 优先，缺 buvid3 就补一个。"""
+    if "buvid3=" in cookie:
+        return cookie
+    buvid = await fetch_buvid3(session)
+    if not buvid:
+        # 一个取不到就写个空值，服务端一样按没带 Cookie 处理，不如保持原样
+        return cookie
+    return f"{cookie}; buvid3={buvid}" if cookie else f"buvid3={buvid}"
+
+
+def _normalize_jump_url(url) -> str:
+    text = str(url or "").strip()
+    if text.startswith("//"):
+        return "https:" + text
+    return text if text.startswith("http") else ""
+
+
+def _dynamic_cover(major: dict, mtype: str) -> str:
+    if mtype == "MAJOR_TYPE_ARCHIVE":
+        return _normalize_jump_url((major.get("archive") or {}).get("cover"))
+    if mtype == "MAJOR_TYPE_OPUS":
+        pics = (major.get("opus") or {}).get("pics") or []
+        return _normalize_jump_url((pics[0] or {}).get("url")) if pics else ""
+    if mtype == "MAJOR_TYPE_DRAW":
+        images = (major.get("draw") or {}).get("images") or []
+        if not images:
+            return ""
+        return _normalize_jump_url(((images[0] or {}).get("img_src") or {}).get("url"))
+    if mtype == "MAJOR_TYPE_ARTICLE":
+        covers = (major.get("article") or {}).get("covers") or []
+        return _normalize_jump_url(covers[0]) if covers else ""
+    return ""
+
+
+def parse_dynamic(item: dict) -> dict | None:
+    """把一条动态压成通知需要的字段；认不出 id 的返回 None。
+
+    动态的种类比稿件杂得多：正文可能在 desc.text，标题在 major.archive/article，
+    图文的内容直接就是正文。统一成 {id, kind, title, text, url, cover, pubtime}
+    之后，推送和去重都不用再关心B站的类型结构。
+    """
+    if not isinstance(item, dict):
+        return None
+    dyn_id = str(item.get("id_str") or "").strip()
+    if not dyn_id:
+        return None
+    dtype = str(item.get("type") or "")
+    modules = item.get("modules") or {}
+    author = modules.get("module_author") or {}
+    dyn = modules.get("module_dynamic") or {}
+    major = dyn.get("major") or {}
+    mtype = str(major.get("type") or "")
+    title = ""
+    if mtype == "MAJOR_TYPE_ARCHIVE":
+        title = str((major.get("archive") or {}).get("title") or "")
+    elif mtype == "MAJOR_TYPE_ARTICLE":
+        title = str((major.get("article") or {}).get("title") or "")
+    elif mtype == "MAJOR_TYPE_OPUS":
+        opus = major.get("opus") or {}
+        title = str(opus.get("title") or "") or str(
+            (opus.get("summary") or {}).get("text") or ""
+        )
+    url = ""
+    for key in ("archive", "article", "opus", "pgc", "draw"):
+        url = _normalize_jump_url((major.get(key) or {}).get("jump_url"))
+        if url:
+            break
+    return {
+        "id": dyn_id,
+        "kind": DYNAMIC_KINDS.get(dtype, DEFAULT_DYNAMIC_KIND),
+        # 投稿类动态带 bvid，用来和稿件监控互相去重（同一个视频只提醒一次）
+        "bvid": str((major.get("archive") or {}).get("bvid") or "").strip(),
+        "action": str(author.get("pub_action") or "").strip(),
+        "title": title.strip(),
+        "text": str((dyn.get("desc") or {}).get("text") or "").strip(),
+        "url": url or f"https://t.bilibili.com/{dyn_id}",
+        "cover": _dynamic_cover(major, mtype),
+        "pubtime": _as_int(author.get("pub_ts")),
+    }
+
+
+async def fetch_up_dynamics(
+    session: aiohttp.ClientSession, mid: str, cookie: str = "", limit: int = 20
+) -> list:
+    """取UP主最新动态（图文/纯文字/转发/专栏/视频都算），按时间从新到旧。
+
+    这个接口既要 WBI 签名又要带 buvid3，缺一样就是 -352；另外它偶发返回
+    code=0 但列表是空的，这种"假空"如果当成基线存下去，下一轮会把整屏历史
+    动态当新内容推出去，所以拿到空列表重试几次再交回调用方判断。
+    """
+    mixin = await fetch_wbi_mixin(session, cookie)
+    cookie = await _dynamic_cookie(session, cookie)
+    params = {
+        "host_mid": mid,
+        "offset": "",
+        "timezone_offset": -480,
+        "features": "itemOpusStyle",
+    }
+    raw_items = []
+    for attempt in range(DYNAMIC_EMPTY_RETRY):
+        # 每次重试都重新签名：wts 是签名的一部分，复用旧串容易被当成重放
+        query = _wbi_signed_query(params, mixin)
+        data = await _get_json(
+            session, f"{DYNAMIC_FEED_URL}?{query}", _dynamic_headers(mid, cookie)
+        )
+        if data.get("code") != 0:
+            raise RoomCheckError(
+                f"bilibili 动态接口返回 code={data.get('code')}（{data.get('message')}）"
+            )
+        raw_items = (data.get("data") or {}).get("items") or []
+        if raw_items or attempt == DYNAMIC_EMPTY_RETRY - 1:
+            break
+        await asyncio.sleep(1)
+    dynamics = []
+    for item in raw_items:
+        parsed = parse_dynamic(item)
+        if parsed:
+            dynamics.append(parsed)
+    dynamics = dynamics[:limit]
+    # 与稿件一样：第 i 条的"上一条"取列表里更旧的那条，用于算"距上次动态"
+    for idx, current in enumerate(dynamics):
+        older = dynamics[idx + 1] if idx + 1 < len(dynamics) else None
+        current["prev_pubtime"] = older["pubtime"] if older else 0
+    return dynamics
+
+
+def _brief(text, limit: int = 120) -> str:
+    """按字数截断，超出补省略号（QQ 群消息太长会被折叠，通知里也没必要全文）。"""
+    text = str(text or "")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def format_dynamic(up: dict, item: dict, since: str = "") -> str:
+    """渲染单条新动态通知。"""
+    lines = [
+        "📣 动态通知",
+        DIVIDER,
+        f"👤 UP：{up['name'] or up['mid']}",
+        f"🏷 类型：{item['kind']}",
+    ]
+    if item["title"]:
+        lines.append(f"📌 标题：{_brief(item['title'])}")
+    body = item["text"] or item["title"]
+    # 图文类动态的正文接口是放在"标题"位置给的，text 为空，这时不再重复打一遍
+    if body and body != item["title"] and (item["title"] or item["kind"] != "视频"):
+        lines.append(f"📝 内容：{_brief(body)}")
+    lines.append(f"🕒 发布：{format_pubtime(item['pubtime'])}")
+    if since:
+        lines.append(f"⏳ 距上次动态：{since}")
+    if item["url"]:
+        lines.append(f"🔗 {item['url']}")
+    return "\n".join(lines)
+
+
+def format_dynamics_batch(up: dict, fresh: list, shown: list, since: str = "") -> str:
+    """一次冒出多条新动态时合并成一条，转发刷屏尤其常见。"""
+    lines = [
+        "📣 动态通知",
+        DIVIDER,
+        f"👤 UP：{up['name'] or up['mid']}",
+    ]
+    if since:
+        lines.append(f"⏳ 最新一条距上次动态：{since}")
+    lines.append(f"🆕 新增 {len(fresh)} 条动态，列出最近 {len(shown)} 条：")
+    for item in shown:
+        lines.append(
+            f"· [{item['kind']}] {_brief(item['title'] or item['text'], 60) or '(无内容)'}"
+        )
+        lines.append(f"  {item['url']}")
+    if len(fresh) > len(shown):
+        lines.append(f"…另有 {len(fresh) - len(shown)} 条动态未列出")
+    return "\n".join(lines)
 
 
 def format_pubtime(pubtime: int) -> str:
@@ -728,6 +1107,7 @@ class LiveMonitorPlugin(Star):
         self.plugin_dir = Path(__file__).parent
         self.rooms: dict = {}
         self.ups: dict = {}
+        self._notify_over: dict = {}
         self._last_check: dict[str, float] = {}
         self.version, repo_url, self.meta_name = read_plugin_meta()
         m = GITHUB_REPO_RE.search(repo_url)
@@ -755,6 +1135,9 @@ class LiveMonitorPlugin(Star):
                 ):
                     self.rooms = self._sanitize(raw.get("rooms"))
                     self.ups = self._sanitize_ups(raw.get("ups"))
+                    self._notify_over = self._sanitize_notify_over(
+                        raw.get("notify_over")
+                    )
                     if raw.get("submissions") or raw.get("reviewers"):
                         # 0.1.2 的「群友投稿 + 管理员审核」在 0.2.0 移除：
                         # 旧数据读不读没意义，直接丢掉，下次 _save 就写成 v3 结构
@@ -769,6 +1152,7 @@ class LiveMonitorPlugin(Star):
             self.logger.warning(f"读取监控数据失败: {e}")
             self.rooms = {}
             self.ups = {}
+            self._notify_over = {}
             self._quarantine_data_file(e)
 
     def _quarantine_data_file(self, error):
@@ -842,6 +1226,24 @@ class LiveMonitorPlugin(Star):
             return {}
         return {str(k): str(v) for k, v in raw.items() if str(k)}
 
+    def _sanitize_notify_over(self, raw) -> dict:
+        """校验 /直播监控 通知 写下的开关覆盖：只认已知项和真正的布尔值。
+
+        这个文件可能被手工编辑过，认错的键名如果照样存下来，就等于多出几个永远关不掉
+        也看不见来源的开关，所以未知项直接丢掉并留日志。
+        """
+        over = {}
+        if not isinstance(raw, dict):
+            return over
+        known = set(NOTIFY_FLAGS.values())
+        for key, value in raw.items():
+            if key not in known:
+                self.logger.warning(f"通知开关里有未知项 {key}，已忽略")
+                continue
+            if isinstance(value, bool):
+                over[str(key)] = value
+        return over
+
     def _sanitize_ups(self, raw) -> dict:
         """校验 ups 段，理由同 _sanitize：手工编辑过的数据不能让轮询炸掉。"""
         ups = {}
@@ -862,12 +1264,21 @@ class LiveMonitorPlugin(Star):
                 "watchers": self._sanitize_sessions(up.get("watchers")),
                 # 列表按从新到旧保存，超出上限的旧稿件直接丢弃
                 "seen": seen[:MAX_SEEN_UPLOADS],
+                # 动态 id 同样是纯去重用的历史，上限独立于稿件
+                "seen_dyn": [
+                    str(d).strip() for d in (up.get("seen_dyn") or []) if str(d).strip()
+                ][:MAX_SEEN_DYNAMICS],
                 "fails": 0,
             }
         return ups
 
     def _save(self):
-        payload = {"version": 4, "rooms": self.rooms, "ups": self.ups}
+        payload = {
+            "version": 5,
+            "rooms": self.rooms,
+            "ups": self.ups,
+            "notify_over": self._notify_over,
+        }
         try:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
             # 先写临时文件再改名覆盖：直接 write_text 若在写一半时崩溃，
@@ -1176,6 +1587,69 @@ class LiveMonitorPlugin(Star):
         self._save()
         yield event.plain_result("已取消本会话对该UP主的稿件通知。")
 
+    @monitor_group.command("通知")
+    async def cmd_notify(self, event, item=None, state=None):
+        """开关推送。用法: /直播监控 通知 [项目] [开|关|默认]"""
+        if deny := self._admin_only(event):
+            yield deny
+            return
+        if item is None:
+            yield event.plain_result(self._notify_status_text())
+            return
+        if state is None:
+            # 只写了项目没写开关：当成查询，不改状态
+            yield event.plain_result(self._notify_status_text())
+            return
+        parsed = self._parse_flag_state(state)
+        if parsed is _FLAG_UNKNOWN:
+            yield event.plain_result(
+                "没看懂开关，请写 开、关 或 默认（默认＝恢复跟随配置文件）。"
+            )
+            return
+        if str(item).strip() in ("全部", "所有", "all"):
+            names = list(NOTIFY_FLAGS)
+        else:
+            conf_key = self._resolve_flag_name(item)
+            if conf_key is None:
+                yield event.plain_result(
+                    f"不认识的通知项目：{item}\n可选项：全部、"
+                    + "、".join(NOTIFY_FLAGS)
+                )
+                return
+            names = [self._flag_name(conf_key)]
+        # 逐项给出说明，一次改全部时也让人看清到底动了哪几项
+        lines = []
+        for name in names:
+            lines.append(self._set_notify_over(NOTIFY_FLAGS[name], parsed))
+        yield event.plain_result("\n".join(lines) + "\n\n" + self._notify_status_text())
+
+    @staticmethod
+    def _parse_flag_state(text):
+        """把 开/关/默认 解析成 True/False/None，认不出来返回 _FLAG_UNKNOWN。"""
+        key = str(text or "").strip().lower()
+        if key in ("开", "打开", "开启", "要", "on", "true", "1", "yes", "y"):
+            return True
+        if key in ("关", "关闭", "关掉", "不要", "off", "false", "0", "no", "n"):
+            return False
+        if key in ("默认", "恢复", "跟随配置", "reset", "default"):
+            return None
+        return _FLAG_UNKNOWN
+
+    @staticmethod
+    def _resolve_flag_name(text) -> str | None:
+        """把用户写的项目名解析成配置键名，认不出返回 None。"""
+        key = str(text or "").strip()
+        if not key:
+            return None
+        if key in NOTIFY_FLAGS:
+            return NOTIFY_FLAGS[key]
+        aliased = NOTIFY_ALIASES.get(key)
+        if aliased:
+            return NOTIFY_FLAGS[aliased]
+        if key in NOTIFY_FLAGS.values():
+            return key
+        return None
+
     def _register_room(self, platform: str, room_id: str) -> dict:
         """把房间加入监控表（不落盘），已存在则返回原记录。"""
         key = room_key(platform, room_id)
@@ -1212,6 +1686,7 @@ class LiveMonitorPlugin(Star):
                 "archive_count": 0,
                 "watchers": {},
                 "seen": [],
+                "seen_dyn": [],
                 "fails": 0,
             }
             self.ups[mid] = up
@@ -1708,31 +2183,37 @@ class LiveMonitorPlugin(Star):
     async def cmd_help(self, event):
         """查看直播监控帮助"""
         yield event.plain_result(
-            "=== 直播开播 / UP主稿件监控 ===\n"
+            "=== 直播开播 / UP主稿件·动态监控 ===\n"
             "指令前缀: /直播监控 或 /开播监控\n"
             "—— 直播间 ——\n"
             "添加 <直播间链接或 平台:房间号>  添加监控并订阅通知（管理员）\n"
             "删除 <平台:房间号>  删除监控\n"
             "订阅 <平台:房间号>  订阅本会话通知\n"
             "取消 <平台:房间号>  取消本会话通知\n"
-            "—— B站UP主新稿件 ——\n"
+            "—— B站UP主稿件/动态 ——\n"
             "监控UP <mid 或 space.bilibili.com/数字>  添加UP主并订阅新稿件通知（管理员）\n"
-            "移除UP <mid 或 UP主昵称>  移除该UP主的稿件监控（管理员）\n"
-            "订阅UP <mid 或 UP主昵称>  订阅本会话稿件通知\n"
-            "退订UP <mid 或 UP主昵称>  取消本会话稿件通知\n"
+            "移除UP <mid 或 UP主昵称>  移除该UP主的监控（管理员）\n"
+            "订阅UP <mid 或 UP主昵称>  订阅本会话的稿件/动态通知\n"
+            "退订UP <mid 或 UP主昵称>  取消本会话的稿件/动态通知\n"
             "—— 通用 ——\n"
             "列表  查看监控的直播间与UP主\n"
+            "通知  查看各类推送开关的当前状态与来源\n"
+            "通知 <开播|关播|稿件|动态|新版提醒|间隔显示|全部> <开|关|默认>  "
+            "在聊天里切换推送；默认＝恢复跟随配置文件，改动会持久化、重启后仍生效（管理员）\n"
             "检查更新  立即查一次 GitHub 上有没有新版插件（管理员）\n"
             "更新 [版本号]  从 GitHub 下载更新包、覆盖插件文件并自动热重载（管理员）；"
             "带版本号可指名要装的版本但必须比当前新，回滚请用备份目录；"
             "插件配置 self_update 可关闭该能力\n"
             "支持平台: B站直播(bili)、斗鱼(douyu)、虎牙(huya/hy)、抖音(douyin)；"
-            "UP主稿件仅支持B站。\n"
+            "UP主稿件与动态仅支持B站。\n"
             "开播/关播会推送主播名、房间号、标题、链接与封面；"
             "UP主发新稿件会推送标题、BV号、发布时间与封面。\n"
+            "UP主动态监控（插件配置 notify_dynamic，默认关闭）覆盖稿件列表拿不到的内容："
+            "图文、纯文字、转发、专栏，以及只发在动态里的「动态视频」；"
+            "同一个视频不会既按稿件又按动态推两次。\n"
             "插件配置 show_elapsed（默认开启）后，开播通知会带上距离上次直播的时间，"
-            "稿件通知会带上距上次更新的时间；不满一天按小时显示，"
-            "取不到上一次时间时这一行自动省略。\n"
+            "稿件通知会带上距上次更新的时间，动态通知会带上距上次动态的时间；"
+            "不满一天按小时显示，取不到上一次时间时这一行自动省略。\n"
             "关播通知会带上本次直播时长（x天x小时 / x小时y分钟 / y分钟），"
             "没抓到这轮开播时刻时省略该行。\n"
             "除 列表/帮助 外的管理指令仅限管理员（插件配置 admin_ids，留空则不限）。\n"
@@ -1760,6 +2241,53 @@ class LiveMonitorPlugin(Star):
             return int(self.conf.get(key) or 0) or fallback
         except (TypeError, ValueError):
             return fallback
+
+    def _conf_flag(self, key: str) -> bool:
+        """配置文件里这个开关的值（没填就用默认值）。"""
+        return bool(self.conf.get(key, NOTIFY_DEFAULTS.get(key, True)))
+
+    def _flag(self, key: str) -> bool:
+        """某个通知开关的当前值：/直播监控 通知 的运行时覆盖优先，其次才是配置文件。
+
+        配置文件归 AstrBot WebUI 管，插件写不进去也不该写；管理员在群里关掉的推送
+        又要活过重启，所以覆盖存在自己的数据文件里，配置文件只作为默认值。
+        """
+        over = self._notify_over.get(key)
+        if over is not None:
+            return bool(over)
+        return self._conf_flag(key)
+
+    def _set_notify_over(self, conf_key: str, value) -> str:
+        """写下运行时覆盖；value 为 None 表示恢复跟随配置文件。返回给用户的说明。"""
+        name = self._flag_name(conf_key)
+        if value is None:
+            self._notify_over.pop(conf_key, None)
+            self._save()
+            return f"「{name}」已恢复跟随配置文件（当前{'开' if self._conf_flag(conf_key) else '关'}）"
+        self._notify_over[conf_key] = bool(value)
+        self._save()
+        return f"「{name}」已{'开启' if value else '关闭'}（已持久化，重启后保持）"
+
+    @staticmethod
+    def _flag_name(conf_key: str) -> str:
+        for name, key in NOTIFY_FLAGS.items():
+            if key == conf_key:
+                return name
+        return conf_key
+
+    def _notify_status_text(self) -> str:
+        lines = ["🔔 通知开关", DIVIDER]
+        for name, conf_key in NOTIFY_FLAGS.items():
+            if conf_key in self._notify_over:
+                source = f"指令覆盖：{'开' if self._notify_over[conf_key] else '关'}"
+            else:
+                source = f"配置文件：{'开' if self._conf_flag(conf_key) else '关'}"
+            mark = "🟢" if self._flag(conf_key) else "⚪️"
+            lines.append(f"{mark} {name}　{source}")
+        lines.append(DIVIDER)
+        lines.append("改法：/直播监控 通知 <" + "、".join(NOTIFY_FLAGS) + "> 开|关")
+        lines.append("恢复跟随配置文件：/直播监控 通知 <项目> 默认")
+        return "\n".join(lines)
 
     def _room_interval(self, room: dict) -> int:
         """未开播房间按开播检测间隔轮询，直播中房间按关播检测间隔轮询。"""
@@ -1792,7 +2320,7 @@ class LiveMonitorPlugin(Star):
             # 热重载后的第一次轮询：先回报更新结果。放在这里而不是 __init__ 里，
             # 是因为插件刚加载时主动消息通道可能还没就绪
             await self._confirm_update()
-        if self.conf.get("update_check", True) and (now >= self._next_update_check):
+        if self._flag("update_check") and (now >= self._next_update_check):
             await self._check_plugin_update(session, now)
         due = []
         for key, room in self.rooms.items():
@@ -1840,7 +2368,7 @@ class LiveMonitorPlugin(Star):
 
     def _show_elapsed(self) -> bool:
         """通知里是否显示"距离上次…"字段：开播通知的距离上次直播、稿件通知的距离上次更新。"""
-        return bool(self.conf.get("show_elapsed", True))
+        return bool(self._flag("show_elapsed"))
 
     def _upload_interval(self) -> int:
         return max(
@@ -1849,6 +2377,16 @@ class LiveMonitorPlugin(Star):
         )
 
     async def _check_up(self, session: aiohttp.ClientSession, up: dict):
+        """一次 UP 主检查：先看稿件，再看动态。
+
+        顺序是有意的：新视频既进稿件列表也会生成一条视频动态，先跑稿件就能把 bvid
+        记进 seen，动态那一路据此跳过，同一个视频不会被提醒两遍。
+        """
+        await self._check_uploads(session, up)
+        if self._flag("notify_dynamic"):
+            await self._check_dynamics(session, up)
+
+    async def _check_uploads(self, session: aiohttp.ClientSession, up: dict):
         """检查UP主有没有新稿件。seen 为空视为基线：只记录、不推送。"""
         cookie = str(self.conf.get("bilibili_cookie") or "")
         uploads = await fetch_up_uploads(session, up["mid"], cookie)
@@ -1865,7 +2403,7 @@ class LiveMonitorPlugin(Star):
         if not fresh:
             self._save()
             return
-        if self.conf.get("notify_upload", True):
+        if self._flag("notify_upload"):
             cap = max(
                 1,
                 self._conf_int("upload_max_notify", DEFAULT_UPLOAD_MAX_NOTIFY),
@@ -1889,6 +2427,65 @@ class LiveMonitorPlugin(Star):
             self.logger.info(
                 f"UP主 {up['mid']}（{up['name']}）新增 {len(fresh)} 条稿件，已推送"
             )
+        self._save()
+
+    async def _check_dynamics(self, session: aiohttp.ClientSession, up: dict):
+        """检查UP主有没有新动态（图文/纯文字/转发/专栏/视频）。
+
+        与稿件同构：seen_dyn 为空只建基线不推送。另外动态接口偶发返回空列表，
+        这种"假空"绝不能用去覆盖已有基线，否则下一轮会把整屏历史动态当新的推出去。
+        """
+        cookie = str(self.conf.get("bilibili_cookie") or "")
+        dynamics = await fetch_up_dynamics(session, up["mid"], cookie)
+        if not dynamics:
+            return
+        latest = [item["id"] for item in dynamics]
+        if not up["seen_dyn"]:
+            up["seen_dyn"] = latest[:MAX_SEEN_DYNAMICS]
+            self._save()
+            return
+        known = set(up["seen_dyn"])
+        known_bvid = set(up["seen"])
+        fresh = [
+            item
+            for item in dynamics
+            if item["id"] not in known and item.get("bvid") not in known_bvid
+        ][::-1]
+        merged = latest + [
+            dyn_id for dyn_id in up["seen_dyn"] if dyn_id not in set(latest)
+        ]
+        up["seen_dyn"] = merged[:MAX_SEEN_DYNAMICS]
+        if not fresh:
+            self._save()
+            return
+        cap = max(
+            1,
+            self._conf_int("upload_max_notify", DEFAULT_UPLOAD_MAX_NOTIFY),
+        )
+        shown = fresh[-cap:]
+        newest = fresh[-1]
+        since = (
+            format_since(newest.get("prev_pubtime"), newest.get("pubtime"))
+            if self._show_elapsed()
+            else ""
+        )
+        if len(shown) == 1:
+            text = format_dynamic(up, shown[0], since)
+            if len(fresh) > len(shown):
+                text += f"\n另有 {len(fresh) - len(shown)} 条新动态未列出"
+            await self._notify(session, up, text, shown[0]["cover"])
+        else:
+            await self._notify(
+                session, up, format_dynamics_batch(up, fresh, shown, since), ""
+            )
+        # 视频类动态本身也是稿件，记进 seen 让稿件那一路别再提醒一次
+        for item in fresh:
+            if item.get("bvid") and item["bvid"] not in up["seen"]:
+                up["seen"].insert(0, item["bvid"])
+        up["seen"] = up["seen"][:MAX_SEEN_UPLOADS]
+        self.logger.info(
+            f"UP主 {up['mid']}（{up['name']}）新增 {len(fresh)} 条动态，已推送"
+        )
         self._save()
 
     async def _check_room(self, session: aiohttp.ClientSession, room: dict):
@@ -1935,7 +2532,7 @@ class LiveMonitorPlugin(Star):
             return
         anchor = room["anchor"] or room["room_id"]
         pname = PLATFORM_NAMES[platform]
-        if prev is False and now is True and self.conf.get("notify_start", True):
+        if prev is False and now is True and self._flag("notify_start"):
             since = format_since(last_live_at, now_ts) if self._show_elapsed() else ""
             lines = [
                 "🔴 开播通知",
@@ -1949,7 +2546,7 @@ class LiveMonitorPlugin(Star):
                 lines.append(f"⏳ 距离上次直播：{since}")
             lines += [DIVIDER, f"🔗 {result['url']}"]
             await self._notify(session, room, "\n".join(lines), room.get("cover", ""))
-        elif prev is True and now is False and self.conf.get("notify_end", True):
+        elif prev is True and now is False and self._flag("notify_end"):
             # 用"最后一次看到在播的时刻"减"本轮开播的时刻"：真实的关播时刻落在两者之间，
             # 读数是最接近的下界，误差最多一个关播检测间隔。没抓到开播时刻就不显示，
             # 否则拿时间戳去减 0 会算出几万天

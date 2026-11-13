@@ -265,6 +265,40 @@ async def fake_up_uploads(session, mid, cookie="", limit=20):
 main.fetch_up_info = fake_up_info
 main.fetch_up_uploads = fake_up_uploads
 
+REAL_FETCH_UP_DYNAMICS = main.fetch_up_dynamics
+
+# mid -> [动态条目（已解析过的形状）]，未登记的 mid 视为没有动态
+DYNAMICS = {}
+# 记录动态接口被调了几次，用于断言"关掉开关就一个请求都不发"
+DYN_CALLS = []
+
+
+def dynamic_item(dyn_id, kind="图文", pubtime=1760000000, bvid="", **kwargs):
+    item = {
+        "id": str(dyn_id),
+        "kind": kind,
+        "bvid": bvid,
+        "action": "发布了动态",
+        "title": kwargs.get("title", f"动态标题{dyn_id}" if kind == "视频" else ""),
+        "text": kwargs.get("text", f"动态正文{dyn_id}"),
+        "url": kwargs.get("url", f"https://t.bilibili.com/{dyn_id}"),
+        "cover": kwargs.get("cover", ""),
+        "pubtime": pubtime,
+    }
+    return item
+
+
+async def fake_up_dynamics(session, mid, cookie="", limit=20):
+    DYN_CALLS.append(str(mid))
+    items = [dict(it) for it in DYNAMICS.get(str(mid), [])][:limit]
+    for idx, current in enumerate(items):
+        older = items[idx + 1] if idx + 1 < len(items) else None
+        current["prev_pubtime"] = older["pubtime"] if older else 0
+    return items
+
+
+main.fetch_up_dynamics = fake_up_dynamics
+
 
 async def _idle_poll(self):
     await asyncio.sleep(3600)
